@@ -12,19 +12,27 @@ Ships as a **single static Go binary** with an embedded web UI that installs
 to a phone's home screen like an app.
 
 ```
-┌ Clip Manager ─────────────────────────────────────────────────────────┐
-│ STORAGE   118.4 GB in 41,203 clips · quota 150 GB                     │
-│ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░                    [Preview cleanup] [Now]  │
-│   front-door   62.1 GB · 21,014        quota [ 80] GB                 │
-│   driveway     41.9 GB · 15,466        quota [ 50] GB                 │
-│   backyard     14.4 GB ·  4,723        quota [   ] GB                 │
-├───────────────────────────────────────────────────────────────────────┤
-│ [All] [front-door] [driveway] [backyard]                              │
-│  12.31.42.dav   front-door · 3.1 MB · Aug 30, 12:31    dav  ↓        │
-│  12.31.29.mp4   driveway · 2.4 MB · Aug 30, 12:31      ▶ Play        │
-│  12.31.14.dav   front-door · 2.9 MB · Aug 30, 12:31    dav  ↓        │
+┌ Clip Manager ──────────────────────────────── [Clips] [Settings] ─────┐
+│ [All] [Front door 709] [Driveway 421] [Backyard 388]      ✏️ Rename   │
+│ [Today] [Yest.] [Aug 29] [Aug 28] [Aug 27] …  ←scrolls                │
+│ [ 285 ] [ 292 ] [ 281 ]  [ 279 ]  [ 282 ]                             │
+│                                                                       │
+│ Today · 285 clips · 1.4 GB                                            │
+│ ▾ 10 PM   16 clips · 83 MB                                            │
+│    10:59:46 PM · Front door   6.4 MB · …_ch3_main_202…     ▶ Play    │
+│    10:56:06 PM · Driveway     3.6 MB · …_ch1_main_202…     ▶ Play    │
+│ ▸ 9 PM    22 clips · 108 MB                                           │
+│ ▸ 8 PM    19 clips · 96 MB                                            │
 └───────────────────────────────────────────────────────────────────────┘
 ```
+
+The home page is the footage, organized for cameras that write **hundreds of
+clips a day**: drill down by **channel** (read from the recordings' own
+filenames, labelable to names that mean something), then by **day** on a
+scrollable strip with per-day counts, then by collapsible **hour**. Each row
+is led by when the recording started. Only the chosen day's clips are ever
+fetched — the menus are drawn from a lightweight summary API. Sources and
+quotas live behind the **Settings** tab.
 
 ---
 
@@ -143,7 +151,8 @@ union of two lists:
 - **Pinned** sources, named on the command line (`--clips`, repeated) or in
   `CLIP_CLIPS_DIR` (colon-separated). The app shows them and cannot remove
   them — what the operator pinned at launch outranks a click in a browser.
-- Sources **added in the app** (the *Sources* panel, or `POST /api/sources`),
+- Sources **added in the app** (the *Sources* panel on the Settings tab, or
+  `POST /api/sources`),
   stored in `config.json`. These can be removed again the same way. The
   directory must already exist: adding adopts footage, it never invents a
   place for it. Removing a source deletes nothing — it takes the directory
@@ -211,20 +220,23 @@ What a **browser** will take directly is a shorter list — `.mp4`, `.webm`,
 range requests).
 
 The rest, **`.dav` above all**, play through the machine's own ffmpeg: the
-server repackages the recording on the fly into fragmented MP4 and streams
-it. The codec is **copied, never re-encoded** — a Dahua camera's H.264 is
-already something a browser decodes, it is only the container the browser
-refuses, and a stream copy is cheap enough for a Raspberry Pi where a
-transcode is not. The trade: a remuxed stream has no known length, so it
-plays from the start rather than scrubbing freely — for a clip a few seconds
-long, that is the whole clip. The row keeps its format badge so the
-difference stays explicable.
+server repackages the recording into a cached, seekable `+faststart` MP4 and
+serves it with range support — the shape iOS Safari insists on before it will
+play a remuxed stream at all. H.264 is **container-copied, not re-encoded** —
+a Dahua camera's H.264 is already something a browser decodes, it is only the
+container the browser refuses, and a copy is cheap enough for a Raspberry Pi.
+HEVC is copied too, tagged `hvc1` (the tag Safari requires); a codec no
+browser decodes — MJPEG in an old `.avi` — is transcoded to H.264, and the
+player retries with a server-side H.264 transcode (`?transcode=1`) before it
+gives up on any clip. Camera audio (usually G.711) is re-encoded to AAC so it
+survives the MP4. Prepared MP4s are cached under the data directory
+(`playcache/`, capped at 512 MB, least recently touched evicted), so a clip
+is repackaged once, not once per view, and scrubbing works everywhere. The
+row keeps its format badge so the difference stays explicable.
 
-Repackaging changes the container and never the codec, so a stream the
-browser genuinely cannot decode — MJPEG in an old `.avi`, H.265 where the
-browser lacks it — still fails, in the player, as a sentence with the
-download beside it rather than a black rectangle. VLC plays anything the
-camera wrote.
+A recording that defeats all of that — a damaged file, ffmpeg missing —
+still fails in the player as a sentence with the download beside it rather
+than a black rectangle. VLC plays anything the camera wrote.
 
 This is the same arrangement as SAND Vault shelling out to git: the app
 carries no codecs of its own, it drives the ffmpeg on the machine — **a clip
@@ -243,9 +255,11 @@ usable from a script:
 | Endpoint | What |
 |---|---|
 | `GET /api/health` | `{status, version, sources, ffmpeg}` — what the installer polls |
-| `GET /api/clips` | every clip across every source: source, path, camera, size, mtime, playable, remuxable — plus which sources were unreadable |
+| `GET /api/clips` | clips across every source: source, path, camera, channel, start time, size, mtime, playable, remuxable — plus which sources were unreadable and the channel labels; `?day=YYYY-MM-DD` and `?channel=` filter, which is how the app fetches (one day at a time) |
+| `GET /api/summary` | the archive without its weight: clip/byte counts per channel and per day (`?channel=` scopes the days), newest day first — what the app draws its menus from |
 | `GET /api/clip?source=…&path=…` | one clip's bytes, with range support; the source must be a configured one |
-| `GET /api/clip/play?source=…&path=…` | the clip repackaged through ffmpeg into streaming MP4 (`.dav` and friends); 422 with ffmpeg's own words when the file defeats it |
+| `GET /api/clip/play?source=…&path=…` | the clip repackaged through ffmpeg into a cached, seekable MP4 (`.dav` and friends); `&transcode=1` forces H.264; 422 with ffmpeg's own words when the file defeats it |
+| `PUT /api/channels/label` | name a channel `{channel, label}` — an empty label forgets the name |
 | `GET /api/sources` | the source set: path, pinned, available |
 | `POST /api/sources` | add a source `{path}` — must exist and be absolute |
 | `DELETE /api/sources?path=…` | forget a runtime-added source (files untouched; pinned ones refuse) |

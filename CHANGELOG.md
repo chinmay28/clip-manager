@@ -10,17 +10,43 @@ tag that shouldn't be published.
 
 ## Unreleased — the 2026.8 line
 
+### Channels, days, hours — and a clean front page
+
+The home page is now the clips and nothing else — the *Sources* and *Storage*
+panels moved to a **Settings** tab. The flat file list is gone, replaced by a
+drill-down built for cameras that write hundreds of clips a day: **channel**,
+then **day**, then **hour**. Channels are read from the recordings' own names
+(`N843A8_ch3_main_…` → channel `N843A8_ch3`, with the camera directory as the
+fallback) and can be **labeled** — select a chip, rename, and "N843A8 ch3"
+becomes "Front door" in every browser, stored in the server's config. Days
+sit in a horizontally scrollable strip (*Today*, *Yest.*, dates), each stop
+carrying its clip count; the chosen day's clips group into collapsible
+**hour sections** ("9 PM · 14 clips · 68 MB") with only the latest hour open
+on a busy day. Each row is led by the time the recording **started**, parsed
+from the filename's timestamp rather than the upload's mtime.
+
+The browsing is as light as it looks: a new `GET /api/summary` carries just
+the counts the menus are drawn from, and `GET /api/clips` takes `?day=` and
+`?channel=` filters — the client fetches one day of one channel at a time,
+so opening the app on a phone no longer downloads the whole archive's
+listing.
+
 ### .dav plays in the browser
 
 Formats a browser will not take directly — `.dav` above all — now play in
-place: the server repackages the recording on the fly through the machine's
-own ffmpeg into fragmented MP4, codec copied, never re-encoded, which is
-cheap enough for a Raspberry Pi. The quickstart installs ffmpeg by default
-(`INSTALL_FFMPEG=never` skips it); without one those formats stay labelled
-downloads and the server says so at startup. A stream the browser genuinely
-cannot decode (MJPEG in an old `.avi`) fails in the player as a sentence with
-the download beside it, and the player header now carries a download for
-every clip.
+place: the server repackages the recording through the machine's own ffmpeg
+into a cached, seekable `+faststart` MP4 served with range support — which is
+what iOS Safari requires before it will play a remuxed stream at all (the
+first cut of this feature streamed fragmented MP4, which desktop Chrome
+accepted and iPhones refused). H.264 is container-copied; HEVC is copied and
+tagged `hvc1`, the tag Safari insists on; codecs no browser decodes (MJPEG in
+an old `.avi`) are transcoded to H.264, and the player falls back to a
+server-side H.264 transcode automatically before it ever gives up on a clip.
+Camera audio (usually G.711) is re-encoded to AAC so it survives the MP4.
+Prepared MP4s are cached in the data directory (capped at 512 MB, oldest
+evicted) so a clip is repackaged once, not once per view. The quickstart
+installs ffmpeg by default (`INSTALL_FFMPEG=never` skips it); without one
+those formats stay labelled downloads and the server says so at startup.
 
 ### One or more source directories
 

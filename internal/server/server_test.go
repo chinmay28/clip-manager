@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -107,5 +109,130 @@ func TestPlayWithoutFFmpegSaysSo(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != 501 {
 		t.Fatalf("want 501 naming the missing tool, got %d", rec.Code)
+	}
+}
+
+func TestChannelLabelRoundTrip(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "N843A8_ch3_main_20260830214636_20260830214641.dav"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, source)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", "/api/channels/label",
+		strings.NewReader(`{"channel":"N843A8_ch3","label":"Front door"}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("label save: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The listing carries the labels back, and the clip carries its channel.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips", nil))
+	var body struct {
+		Clips         []map[string]any  `json:"clips"`
+		ChannelLabels map[string]string `json:"channel_labels"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ChannelLabels["N843A8_ch3"] != "Front door" {
+		t.Fatalf("labels did not round-trip: %v", body.ChannelLabels)
+	}
+	if len(body.Clips) != 1 || body.Clips[0]["channel"] != "N843A8_ch3" {
+		t.Fatalf("clip channel not parsed: %v", body.Clips)
+	}
+
+	// A quota save must not wipe the label (it edits quotas, nothing else).
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("PUT", "/api/storage/config", strings.NewReader(`{"quota_bytes":1024}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("config save: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips", nil))
+	body.ChannelLabels = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ChannelLabels["N843A8_ch3"] != "Front door" {
+		t.Fatal("a quota save wiped the channel labels")
+	}
+
+	// An empty label forgets the channel's name.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("PUT", "/api/channels/label",
+		strings.NewReader(`{"channel":"N843A8_ch3","label":""}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("label clear: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestSummaryAndDayFilter(t *testing.T) {
+	source := t.TempDir()
+	for _, name := range []string{
+		"N843A8_ch3_main_20260830214636_20260830214641.dav",
+		"N843A8_ch3_main_20260830090000_20260830090005.dav",
+		"N843A8_ch4_main_20260830120000_20260830120005.dav",
+		"N843A8_ch3_main_20260829120000_20260829120005.dav",
+	} {
+		if err := os.WriteFile(filepath.Join(source, name), []byte("xxxx"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := testServer(t, source)
+
+	// The summary: channel totals over everything, day rows newest first.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/summary", nil))
+	var sum struct {
+		Channels map[string]struct{ Clips int } `json:"channels"`
+		Days     []struct {
+			Day   string `json:"day"`
+			Clips int    `json:"clips"`
+		} `json:"days"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Channels["N843A8_ch3"].Clips != 3 || sum.Channels["N843A8_ch4"].Clips != 1 {
+		t.Fatalf("channel totals wrong: %+v", sum.Channels)
+	}
+	if len(sum.Days) != 2 || sum.Days[0].Day != "2026-08-30" || sum.Days[0].Clips != 3 || sum.Days[1].Clips != 1 {
+		t.Fatalf("day rows wrong: %+v", sum.Days)
+	}
+
+	// Scoped to one channel, the days reflect only its clips.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/summary?channel=N843A8_ch4", nil))
+	sum.Days = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if len(sum.Days) != 1 || sum.Days[0].Clips != 1 {
+		t.Fatalf("channel-scoped day rows wrong: %+v", sum.Days)
+	}
+
+	// The listing, one day of one channel at a time.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips?day=2026-08-30&channel=N843A8_ch3", nil))
+	var body struct {
+		Clips []map[string]any `json:"clips"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Clips) != 2 {
+		t.Fatalf("want 2 clips for ch3 on the 30th, got %d", len(body.Clips))
+	}
+
+	// A malformed day is refused, not silently empty.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips?day=yesterday", nil))
+	if rec.Code != 400 {
+		t.Fatalf("want 400 for a bad day, got %d", rec.Code)
 	}
 }

@@ -8,10 +8,12 @@
 package server
 
 import (
+	"context"
+	"crypto/sha256"
 	"embed"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"io/fs"
 	"log"
 	"net/http"
@@ -19,6 +21,8 @@ import (
 	"os/exec"
 	"path"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -47,14 +51,19 @@ type Server struct {
 	ConfigPath string
 	// FFmpeg is the path to an ffmpeg binary, or empty when the machine has
 	// none. It is what turns a .dav from a download into something the
-	// browser plays: /api/clip/play repackages the recording through it on
-	// the fly. Found once at startup — a tool appearing mid-flight is a
+	// browser plays: /api/clip/play repackages the recording through it into
+	// a cached MP4. Found once at startup — a tool appearing mid-flight is a
 	// restart, not a poll.
 	FFmpeg string
 
 	// mu serialises config writes and enforcement runs. Listings do not take
 	// it — they read the directories, which is safe beside a delete.
 	mu sync.Mutex
+
+	// playMu guards playLocks, the per-clip locks that keep two requests for
+	// the same recording from running two ffmpegs over it.
+	playMu    sync.Mutex
+	playLocks map[string]*sync.Mutex
 }
 
 // Handler builds the routing table.
@@ -62,11 +71,13 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/clips", s.handleClips)
+	mux.HandleFunc("GET /api/summary", s.handleSummary)
 	mux.HandleFunc("GET /api/clip", s.handleClip)
 	mux.HandleFunc("GET /api/clip/play", s.handleClipPlay)
 	mux.HandleFunc("GET /api/sources", s.handleSourcesGet)
 	mux.HandleFunc("POST /api/sources", s.handleSourceAdd)
 	mux.HandleFunc("DELETE /api/sources", s.handleSourceRemove)
+	mux.HandleFunc("PUT /api/channels/label", s.handleChannelLabel)
 	mux.HandleFunc("GET /api/storage", s.handleStorage)
 	mux.HandleFunc("PUT /api/storage/config", s.handleConfigPut)
 	mux.HandleFunc("POST /api/storage/enforce", s.handleEnforce)
@@ -150,6 +161,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// dayOf buckets a clip by the calendar day its recording started, in the
+// server's local zone — the same zone the timestamps were parsed in.
+func dayOf(c clips.Clip) string { return c.StartTime.Local().Format("2006-01-02") }
+
+// handleClips lists clips — all of them, or one day of one channel. The
+// filters exist because the volume demands them: cameras write hundreds of
+// clips a day, and a client that only wants Tuesday's front door footage
+// should not be handed the entire archive to throw most of it away.
+//
+//	?day=2026-08-30   only clips whose recording started that day (local time)
+//	?channel=X        only that channel ("" is a real channel: the clips
+//	                  nothing claims — presence of the parameter is what
+//	                  filters, so it must be Has, not a zero check)
 func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 	srcs, err := s.sources()
 	if err != nil {
@@ -157,12 +181,165 @@ func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	list, missing := clips.ScanAll(srcs)
+
+	q := r.URL.Query()
+	if day := q.Get("day"); day != "" {
+		if _, err := time.ParseInLocation("2006-01-02", day, time.Local); err != nil {
+			httpError(w, http.StatusBadRequest, "day must be YYYY-MM-DD (got %q)", day)
+			return
+		}
+		list = filterClips(list, func(c clips.Clip) bool { return dayOf(c) == day })
+	}
+	if q.Has("channel") {
+		channel := q.Get("channel")
+		list = filterClips(list, func(c clips.Clip) bool { return c.Channel == channel })
+	}
+
 	if s.FFmpeg != "" {
 		for i := range list {
 			list[i].Remuxable = clips.RemuxCandidate(list[i].Ext)
 		}
 	}
-	writeJSON(w, map[string]any{"clips": list, "missing_sources": missing})
+	// The channel labels ride along with the clips because they are read
+	// together every time: a listing without its labels would flash raw
+	// channel keys at the user on every load.
+	cfg, err := storage.Load(s.ConfigPath)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
+		return
+	}
+	labels := cfg.ChannelLabels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	writeJSON(w, map[string]any{"clips": list, "missing_sources": missing, "channel_labels": labels})
+}
+
+func filterClips(list []clips.Clip, keep func(clips.Clip) bool) []clips.Clip {
+	out := list[:0]
+	for _, c := range list {
+		if keep(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// handleSummary is the shape of the archive without its weight: how many
+// clips each channel holds, and — for one channel or all of them — how many
+// each day holds, newest day first. It is what the client navigates by; the
+// clips themselves come one day at a time from /api/clips. At hundreds of
+// clips a day the full listing runs to megabytes, and a phone opening the app
+// to check one camera should not download the archive to draw a menu.
+//
+//	?channel=X   day counts for that channel only (channel totals stay global
+//	             — the chips keep their numbers while one is selected)
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	srcs, err := s.sources()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading sources: %v", err)
+		return
+	}
+	list, missing := clips.ScanAll(srcs)
+
+	type bucket struct {
+		Clips int   `json:"clips"`
+		Bytes int64 `json:"bytes"`
+	}
+	channels := map[string]*bucket{}
+	for _, c := range list {
+		b := channels[c.Channel]
+		if b == nil {
+			b = &bucket{}
+			channels[c.Channel] = b
+		}
+		b.Clips++
+		b.Bytes += c.Size
+	}
+
+	q := r.URL.Query()
+	if q.Has("channel") {
+		channel := q.Get("channel")
+		list = filterClips(list, func(c clips.Clip) bool { return c.Channel == channel })
+	}
+	type dayRow struct {
+		Day   string `json:"day"`
+		Clips int    `json:"clips"`
+		Bytes int64  `json:"bytes"`
+	}
+	byDay := map[string]*dayRow{}
+	for _, c := range list {
+		day := dayOf(c)
+		row := byDay[day]
+		if row == nil {
+			row = &dayRow{Day: day}
+			byDay[day] = row
+		}
+		row.Clips++
+		row.Bytes += c.Size
+	}
+	days := make([]dayRow, 0, len(byDay))
+	for _, row := range byDay {
+		days = append(days, *row)
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
+
+	cfg, err := storage.Load(s.ConfigPath)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
+		return
+	}
+	labels := cfg.ChannelLabels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	writeJSON(w, map[string]any{
+		"channels":        channels,
+		"days":            days,
+		"channel_labels":  labels,
+		"missing_sources": missing,
+	})
+}
+
+// handleChannelLabel names (or, with an empty label, un-names) one channel.
+// Labels are cosmetic — nothing enforces against them — so this endpoint edits
+// exactly one key and leaves the rest of the config alone.
+func (s *Server) handleChannelLabel(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Channel string `json:"channel"`
+		Label   string `json:"label"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpError(w, http.StatusBadRequest, "bad request: %v", err)
+		return
+	}
+	channel := strings.TrimSpace(body.Channel)
+	if channel == "" {
+		httpError(w, http.StatusBadRequest, "channel is required")
+		return
+	}
+	label := strings.TrimSpace(body.Label)
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := storage.Load(s.ConfigPath)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
+		return
+	}
+	if label == "" {
+		delete(cfg.ChannelLabels, channel)
+	} else {
+		if cfg.ChannelLabels == nil {
+			cfg.ChannelLabels = map[string]string{}
+		}
+		cfg.ChannelLabels[channel] = label
+	}
+	if err := storage.Save(s.ConfigPath, cfg); err != nil {
+		httpError(w, http.StatusInternalServerError, "saving config: %v", err)
+		return
+	}
+	writeJSON(w, map[string]any{"channel": channel, "label": label})
 }
 
 // handleSourcesGet lists the effective source set: path, whether the command
@@ -303,76 +480,221 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, full)
 }
 
-// handleClipPlay streams a recording the browser cannot take as-is —
-// .dav above all — repackaged on the fly into fragmented MP4. The codec is
-// copied, never re-encoded: a Dahua camera's H.264 is already something a
-// browser decodes, it is only the container the browser refuses, and a stream
-// copy is cheap enough for a Raspberry Pi where a transcode is not.
+// handleClipPlay serves a recording the browser cannot take as-is — .dav
+// above all — as a real MP4 file, prepared once through ffmpeg and cached.
 //
-// The output has no known length, so there is no Content-Length and no range
-// support — the player streams from the start rather than scrubbing freely.
-// The trade is deliberate: seekable output would mean remuxing the whole file
-// to disk first, and a clip a few seconds long does not earn that.
+// It used to stream fragmented MP4 straight out of ffmpeg's stdout, which
+// desktop Chrome played and iOS Safari flatly refused: Safari insists on
+// range requests against a resource with a known length. So the recording is
+// repackaged into a complete `+faststart` MP4 on disk first and served with
+// http.ServeFile, which gives every browser the ranges, the length, and the
+// scrubbing the old stream never had. A security clip is seconds long; the
+// remux is subsecond and paid once per clip, not once per view.
 //
-// ffmpeg's first bytes are awaited before the response status is committed,
-// because failure here is ordinary — an .avi carrying MJPEG, a truncated
-// file — and it must arrive as an error the client can read, not a 200 that
-// dies mid-body.
+// What ffmpeg does to the video stream depends on what is in it:
+//
+//   - H.264 → container copy. Every browser decodes it.
+//   - HEVC  → container copy, tagged hvc1 — the tag Safari requires before it
+//     will even try (ffmpeg's default hev1 reads as undecodable there).
+//   - anything else (MJPEG in an old .avi, MPEG-4 part 2…) → transcode to
+//     H.264, because no browser will ever decode it natively.
+//
+// `?transcode=1` forces the H.264 transcode: the player's fallback for a
+// browser that cannot decode the copied codec (HEVC on Firefox, say). And a
+// copy that fails mid-remux falls back to transcoding on its own — the goal
+// is that Play plays, not that the cheap path was tried.
 func (s *Server) handleClipPlay(w http.ResponseWriter, r *http.Request) {
-	if s.FFmpeg == "" {
-		httpError(w, http.StatusNotImplemented, "playing this format needs ffmpeg on the server, and none was found — install it and restart, or download the clip instead")
-		return
-	}
 	full, ok := s.resolve(r.URL.Query().Get("source"), r.URL.Query().Get("path"))
 	if !ok {
 		httpError(w, http.StatusBadRequest, "bad source or path")
 		return
 	}
-
-	// CommandContext ties ffmpeg's life to the request: a closed tab kills
-	// the process rather than leaving it piping into nothing.
-	cmd := exec.CommandContext(r.Context(), s.FFmpeg,
-		"-v", "error",
-		"-i", full,
-		"-c", "copy",
-		// Fragmented MP4 is what makes an unseekable pipe playable at all:
-		// a plain MP4 puts its index at the end, which a stream never
-		// reaches until it is over.
-		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
-		"-f", "mp4", "pipe:1",
-	)
-	var stderr strings.Builder
-	cmd.Stderr = &stderr
-	stdout, err := cmd.StdoutPipe()
+	if s.FFmpeg == "" {
+		httpError(w, http.StatusNotImplemented, "playing this format needs ffmpeg on the server, and none was found — install it and restart, or download the clip instead")
+		return
+	}
+	info, err := os.Stat(full)
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "starting ffmpeg: %v", err)
+		httpError(w, http.StatusNotFound, "clip not found")
 		return
 	}
-	if err := cmd.Start(); err != nil {
-		httpError(w, http.StatusInternalServerError, "starting ffmpeg: %v", err)
-		return
+	mode := "auto"
+	if r.URL.Query().Get("transcode") == "1" {
+		mode = "transcode"
 	}
-	defer cmd.Wait()
 
-	// The probe read: EOF before a single byte means ffmpeg gave up on the
-	// input, and whatever it said on stderr is the only useful answer.
-	first := make([]byte, 64*1024)
-	n, readErr := io.ReadAtLeast(stdout, first, 1)
-	if n == 0 {
-		cmd.Wait()
-		msg := strings.TrimSpace(stderr.String())
-		if msg == "" && readErr != nil {
-			msg = readErr.Error()
+	// The cache key is the clip's identity AND its content (size, mtime): a
+	// camera overwriting a file yields a fresh entry, not a stale replay.
+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s\x00%d\x00%d\x00%s", full, info.Size(), info.ModTime().UnixNano(), mode)))
+	key := hex.EncodeToString(sum[:12])
+	cached := filepath.Join(s.playCacheDir(), key+".mp4")
+
+	if _, err := os.Stat(cached); err != nil {
+		unlock := s.lockPlay(key)
+		// Re-check under the lock: the request holding it before us may have
+		// prepared exactly this file.
+		if _, err := os.Stat(cached); err != nil {
+			if err := s.preparePlay(r.Context(), full, cached, mode); err != nil {
+				unlock()
+				httpError(w, http.StatusUnprocessableEntity, "ffmpeg could not repackage this clip: %v", err)
+				return
+			}
+			s.prunePlayCache()
 		}
-		httpError(w, http.StatusUnprocessableEntity, "ffmpeg could not repackage this clip: %s", msg)
-		return
+		unlock()
 	}
 
 	w.Header().Set("Content-Type", "video/mp4")
-	if _, err := w.Write(first[:n]); err != nil {
-		return // the client went away; the deferred Wait reaps ffmpeg
+	http.ServeFile(w, r, cached)
+}
+
+func (s *Server) playCacheDir() string {
+	return filepath.Join(filepath.Dir(s.ConfigPath), "playcache")
+}
+
+// lockPlay takes the per-clip preparation lock, so two tabs asking for the
+// same recording run one ffmpeg between them. The returned func releases it.
+func (s *Server) lockPlay(key string) func() {
+	s.playMu.Lock()
+	if s.playLocks == nil {
+		s.playLocks = map[string]*sync.Mutex{}
 	}
-	io.Copy(w, stdout)
+	mu := s.playLocks[key]
+	if mu == nil {
+		mu = &sync.Mutex{}
+		s.playLocks[key] = mu
+	}
+	s.playMu.Unlock()
+	mu.Lock()
+	return mu.Unlock
+}
+
+// videoCodecRe reads the video codec out of ffmpeg's own description of an
+// input — `Stream #0:0: Video: h264 (Main), yuv420p…` → "h264". ffprobe would
+// be the purpose-built tool, but ffmpeg is the one binary this app requires
+// and its banner carries the same answer.
+var videoCodecRe = regexp.MustCompile(`Video: ([A-Za-z0-9_]+)`)
+
+func (s *Server) probeVideoCodec(ctx context.Context, in string) (string, error) {
+	// With no output file ffmpeg prints the input description and exits
+	// non-zero; the exit code is noise, the description is the product.
+	out, _ := exec.CommandContext(ctx, s.FFmpeg, "-hide_banner", "-i", in).CombinedOutput()
+	if m := videoCodecRe.FindSubmatch(out); m != nil {
+		return strings.ToLower(string(m[1])), nil
+	}
+	msg := strings.TrimSpace(string(out))
+	if i := strings.LastIndexByte(msg, '\n'); i >= 0 {
+		msg = strings.TrimSpace(msg[i+1:]) // the last line is ffmpeg's verdict
+	}
+	if msg == "" {
+		msg = "no video stream found"
+	}
+	return "", fmt.Errorf("%s", msg)
+}
+
+// preparePlay writes the browser-ready MP4 for one recording: probe, copy or
+// transcode per the rules on handleClipPlay, into a temp file renamed over
+// the cache path only when ffmpeg succeeded — a half-written MP4 must never
+// be servable.
+func (s *Server) preparePlay(ctx context.Context, in, cached, mode string) error {
+	if err := os.MkdirAll(filepath.Dir(cached), 0o755); err != nil {
+		return err
+	}
+	transcodeArgs := []string{"-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p"}
+	if mode == "transcode" {
+		return s.runFFmpeg(ctx, in, cached, transcodeArgs)
+	}
+	codec, err := s.probeVideoCodec(ctx, in)
+	if err != nil {
+		return err
+	}
+	var copyArgs []string
+	switch codec {
+	case "h264":
+		copyArgs = []string{"-c:v", "copy"}
+	case "hevc", "h265":
+		copyArgs = []string{"-c:v", "copy", "-tag:v", "hvc1"}
+	}
+	if copyArgs != nil {
+		if err := s.runFFmpeg(ctx, in, cached, copyArgs); err == nil {
+			return nil
+		}
+		// The copy failed on a codec that should have copied — a damaged
+		// stream, usually. The transcode below decodes around much of that.
+	}
+	return s.runFFmpeg(ctx, in, cached, transcodeArgs)
+}
+
+func (s *Server) runFFmpeg(ctx context.Context, in, out string, videoArgs []string) error {
+	// Video stream 0 and the first audio stream if any; data and subtitle
+	// streams (Dahua files carry both) never survive into the MP4. Audio is
+	// re-encoded to AAC unconditionally — camera audio is G.711 more often
+	// than not, which no browser plays inside an MP4.
+	args := []string{"-v", "error", "-y", "-i", in,
+		"-map", "0:v:0", "-map", "0:a:0?", "-dn", "-sn"}
+	args = append(args, videoArgs...)
+	args = append(args, "-c:a", "aac", "-movflags", "+faststart", "-f", "mp4")
+	tmp := fmt.Sprintf("%s.tmp%d", out, os.Getpid())
+	args = append(args, tmp)
+
+	cmd := exec.CommandContext(ctx, s.FFmpeg, args...)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		os.Remove(tmp)
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" {
+			msg = err.Error()
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	return os.Rename(tmp, out)
+}
+
+// playCacheCap bounds the prepared-MP4 cache. Half a gigabyte holds days of
+// short clips; past it the least recently touched go first. The cache is a
+// convenience, never the record — every entry can be rebuilt from the
+// recording it came from.
+const playCacheCap = 512 << 20
+
+func (s *Server) prunePlayCache() {
+	dir := s.playCacheDir()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	type file struct {
+		name string
+		size int64
+		at   time.Time
+	}
+	var files []file
+	var total int64
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || e.IsDir() {
+			continue
+		}
+		if !strings.HasSuffix(e.Name(), ".mp4") {
+			// A .tmp still warm may belong to a running ffmpeg; one gone
+			// cold is a crashed run's leavings.
+			if time.Since(info.ModTime()) > time.Hour {
+				os.Remove(filepath.Join(dir, e.Name()))
+			}
+			continue
+		}
+		files = append(files, file{e.Name(), info.Size(), info.ModTime()})
+		total += info.Size()
+	}
+	sort.Slice(files, func(i, j int) bool { return files[i].at.Before(files[j].at) })
+	for _, f := range files {
+		if total <= playCacheCap {
+			break
+		}
+		if os.Remove(filepath.Join(dir, f.name)) == nil {
+			total -= f.size
+		}
+	}
 }
 
 // resolve turns an API-supplied (source, relative path) pair into an absolute
@@ -434,15 +756,17 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	// This endpoint edits the quotas and nothing else. Sources have their
-	// own endpoints — a quota save must not silently drop a source somebody
-	// added between this client's load and its save.
+	// This endpoint edits the quotas and nothing else. Sources and channel
+	// labels have their own endpoints — a quota save must not silently drop
+	// a source or a label somebody set between this client's load and its
+	// save.
 	current, err := storage.Load(s.ConfigPath)
 	if err != nil {
 		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
 		return
 	}
 	cfg.Sources = current.Sources
+	cfg.ChannelLabels = current.ChannelLabels
 	if err := storage.Save(s.ConfigPath, cfg); err != nil {
 		httpError(w, http.StatusInternalServerError, "saving config: %v", err)
 		return

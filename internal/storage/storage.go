@@ -40,6 +40,11 @@ type Config struct {
 	// Sources are the clip directories added at runtime (through the app),
 	// alongside whatever the command line pinned. Absolute paths.
 	Sources []string `json:"sources,omitempty"`
+	// ChannelLabels are the names people gave their channels, keyed by the
+	// channel identity internal/clips reads from the recordings
+	// ("N843A8_ch3"). Purely cosmetic — quotas and enforcement never look at
+	// them — so a label can be set, changed or dropped without consequence.
+	ChannelLabels map[string]string `json:"channel_labels,omitempty"`
 }
 
 // Load reads the config, returning an empty policy when the file does not
