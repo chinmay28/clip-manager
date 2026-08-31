@@ -14,7 +14,7 @@ web/dist/
 # in it — so any face dropped in here stays on the machine that builds.
 #
 # The exception is the one the repository ships: an open-licensed face, cut
-# down to the letters of "Manager" and travelling with its OFL.txt, which is
+# down to the letters of "Clip Manager" and travelling with its OFL.txt, which is
 # exactly what that licence permits. See web/fonts/README.md.
 web/fonts/*.woff
 web/fonts/*.woff2

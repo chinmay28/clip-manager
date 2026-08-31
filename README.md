@@ -12,7 +12,7 @@ Ships as a **single static Go binary** with an embedded web UI that installs
 to a phone's home screen like an app.
 
 ```
-┌ CLIP Manager ─────────────────────────────────────────────────────────┐
+┌ Clip Manager ─────────────────────────────────────────────────────────┐
 │ STORAGE   118.4 GB in 41,203 clips · quota 150 GB                     │
 │ ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░                    [Preview cleanup] [Now]  │
 │   front-door   62.1 GB · 21,014        quota [ 80] GB                 │

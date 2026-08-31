@@ -1,11 +1,13 @@
 # The wordmark's script face
 
-The second half of the wordmark — *Manager* — is written rather than set. This
-is where the face it is written in lives.
+The wordmark — *Clip Manager* — is written rather than set, the whole name in
+one hand. (SAND Vault's lockup mixes a mono acronym with a script word because
+SAND is an acronym; Clip is just a word, so both words here wear the same
+face.) This is where that face lives.
 
 ## What ships here
 
-`wordmark-script.woff2` — **4.2 KB**, the glyphs of `Manager` and nothing
+`wordmark-script.woff2` — **5.8 KB**, the glyphs of `Clip Manager` and nothing
 else. It is a subset of [**Caveat**](https://fonts.google.com/specimen/Caveat)
 by Pablo Impallari, used under the SIL Open Font License 1.1, whose full text
 is in `OFL.txt` beside it. A monoline hand with a large x-height and short

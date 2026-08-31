@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the wordmark's script face: the wordmark glyphs, as a woff2.
 
-The wordmark draws exactly one word — *Manager* — so shipping a whole script
+The wordmark draws exactly one name — *Clip Manager* — so shipping a whole script
 family to draw it would be a few hundred kilobytes of glyphs nobody ever sees,
 in a file the build embeds directly into index.html. This cuts the face down to
 the letters that are actually drawn, which is the difference between two
@@ -38,7 +38,7 @@ REPO = Path(__file__).resolve().parent.parent
 OUT = REPO / "web" / "fonts" / "wordmark-script.woff2"
 
 # The word the wordmark writes. Nothing else needs to be in the file.
-TEXT = "Manager"
+TEXT = "Clip Manager"
 
 
 def main() -> int:

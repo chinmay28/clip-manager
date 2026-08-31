@@ -30,53 +30,44 @@ export function Brand({ size = 'md' }) {
         }}
       />
       <span style={{ display: 'flex', flexDirection: 'column', lineHeight: 1.15 }}>
-        {/* Two-tone wordmark, in two hands. CLIP is the machine half of the
-            name — tracked-out monospace in the accent — and Manager is
-            written, in the handwriting face the platform has, sitting back in
-            the text colour: the pair reads as one name, and the join between
-            them is the point rather than a coincidence.
+        {/* The wordmark: one name, written in one hand. SAND Vault's lockup
+            pairs a tracked-out mono acronym with a script word, because SAND
+            *is* an acronym — the machine half of that name. Clip is just a
+            word, so setting it in caps-and-tracking would be borrowing a
+            costume: both words here wear the same script, the same case and
+            the same size, and only the colour tells them apart — Clip in the
+            accent, Manager sitting back — so the pair still reads as one name
+            with a front and a back rather than two styles glued together.
 
-            A script is drawn joined, so the tracking that spaces CLIP out has
-            to come off it — letters set 5px apart stop being handwriting. It
-            is set larger to compensate for a script's smaller x-height, and
-            hangs on the same baseline via `alignItems: baseline` rather than
-            being nudged with a magic number.
+            A script sits small for its point size, so the wordmark is set
+            larger than the equivalent sans would be — tuned against the face
+            in web/fonts (Caveat, large x-height) to hold its own beside the
+            mark without shouting. It is the one number to touch if the face
+            ever changes.
+
+            No added tracking: a script is drawn joined, and letters spaced
+            apart stop being handwriting. And deliberately not italic — every
+            face in the stack is already written on a slant, so asking for
+            italic on top makes the browser synthesise a second one: a script
+            sheared over again, which is exactly as bad as it sounds.
 
             The wordmark never wraps, so on a narrow screen it is the thing
-            that decides how wide the header has to be — size and tracking come
-            down with the viewport rather than pushing everything else off. */}
+            that decides how wide the header has to be — size comes down with
+            the viewport rather than pushing everything else off. */}
         <span style={{
-          display: 'inline-flex',
-          alignItems: 'baseline',
-          fontSize: large ? 'clamp(20px, 6.4vw, 26px)' : 'clamp(13.5px, 4.4vw, 17px)',
+          fontFamily: FONT.script,
+          fontWeight: 500,
+          fontSize: large ? 'clamp(27px, 8.6vw, 35px)' : 'clamp(18px, 5.9vw, 23px)',
+          letterSpacing: '0.01em',
+          lineHeight: 1,
           whiteSpace: 'nowrap',
+          // Room on the left for a swash to lean into: a script glyph can
+          // start left of where it is measured from, and a clipped C reads
+          // as a rendering bug rather than a design.
+          paddingLeft: '0.06em',
         }}>
-          <span style={{
-            fontFamily: FONT.mono,
-            fontWeight: 700,
-            letterSpacing: large ? 'clamp(4px, 1.7vw, 7px)' : 'clamp(2px, 1vw, 4px)',
-            color: COLORS.accent,
-          }}>CLIP</span>
-          <span style={{
-            fontFamily: FONT.script,
-            // Scripts sit small for their point size, and a swash can start
-            // left of where the glyph is measured from — hence the size bump
-            // and the room on the left for it to lean into. Tuned against the
-            // face in web/fonts, where this lands the script's x-height near
-            // CLIP's cap height without letting it shout the mono down. It is
-            // the one number to touch if the face ever changes — a script with
-            // a smaller x-height wants noticeably more.
-            fontSize: '1.35em',
-            fontWeight: 500,
-            // Deliberately not italic. Every face in the stack is already
-            // written on a slant, so asking for italic on top of that makes
-            // the browser synthesise a second one — a script sheared over
-            // again, which is exactly as bad as it sounds.
-            letterSpacing: '0.01em',
-            paddingLeft: '0.08em',
-            marginLeft: large ? '5px' : '3px',
-            color: COLORS.textDim,
-          }}>Manager</span>
+          <span style={{ color: COLORS.accent }}>Clip</span>
+          <span style={{ color: COLORS.textDim }}> Manager</span>
         </span>
         <span style={{
           fontFamily: FONT.mono,
