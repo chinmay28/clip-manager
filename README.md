@@ -31,8 +31,11 @@ clips a day**: drill down by **channel** (read from the recordings' own
 filenames, labelable to names that mean something), then by **day** on a
 scrollable strip with per-day counts, then by collapsible **hour**. Each row
 is led by when the recording started. Only the chosen day's clips are ever
-fetched — the menus are drawn from a lightweight summary API. Sources and
-quotas live behind the **Settings** tab.
+fetched — the menus are drawn from a lightweight summary API — and every
+listing is answered instantly from the **scan cache**: the last walk's
+answer (persisted across restarts), served while a fresh walk runs behind
+it, with the response marked `stale` so the app quietly re-asks until the
+walk lands. Sources and quotas live behind the **Settings** tab.
 
 ---
 
@@ -217,6 +220,10 @@ What keeps this safe to run unattended:
 - **Dry run first.** *Preview cleanup* in the app, `clip prune --dry-run` from
   the shell, or `POST /api/storage/enforce?dry_run=1` — all answer "what would
   go" without touching anything.
+- **Never off a cache.** Enforcement always walks the directories fresh —
+  the scan cache that makes listings instant is never what footage is
+  deleted against, and it is dropped after a cleanup so no listing shows
+  clips that are gone.
 
 Enforcement runs hourly under `serve` (`--enforce-every` changes it, `0`
 disables it), on demand from the app, and as a one-shot from the shell —
@@ -281,6 +288,13 @@ usable from a script:
 | `PUT /api/storage/config` | replace the quota config (sources are untouched — they have their own endpoints) |
 | `POST /api/storage/enforce` | run enforcement now; `?dry_run=1` to only report |
 
+Listing responses (`/api/clips`, `/api/summary`, `/api/storage`) carry
+`"stale": true` when answered from the scan cache while a rescan runs behind
+them — ask again shortly and the flag clears once the fresh walk lands. The
+snapshot lives in the data directory (`scancache.json.gz`) beside the config
+and the play cache; deleting it costs nothing but the next start's head
+start.
+
 ---
 
 ## Building from Source
@@ -337,7 +351,7 @@ the full commit graph (`fetch-depth: 0`, or `--filter=blob:none` rather than
 clip-manager/
 ├── cmd/clip/                    # CLI: serve, prune, version
 ├── internal/
-│   ├── clips/                   # the directory walk: clips, cameras, playability
+│   ├── clips/                   # the directory walk: clips, channels, playability, the scan cache
 │   ├── storage/                 # quotas: config, usage, oldest-first enforcement
 │   ├── server/                  # JSON API + embedded SPA (dist/ is committed)
 │   └── version/                 # YEAR/MONTH; PATCH stamped at link time

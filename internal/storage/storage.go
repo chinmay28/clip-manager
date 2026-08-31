@@ -126,12 +126,11 @@ type Usage struct {
 	Missing []string `json:"missing,omitempty"`
 }
 
-// Measure totals the clips under every source. It counts what internal/clips
-// counts — footage — so the figure is the one quotas are compared against,
-// not a disk `du` that would include foreign files enforcement will never
-// delete.
-func Measure(sources []string) Usage {
-	list, missing := clips.ScanAll(sources)
+// Measure totals a listing of the sources' clips — the walk's own output
+// (clips.ScanAll or the scan cache's Listing), which is what keeps the
+// figure the one quotas are compared against: footage, not a disk `du` that
+// would include foreign files enforcement will never delete.
+func Measure(sources []string, list []clips.Clip, missing []string) Usage {
 	u := Usage{
 		Channels: map[string]Subtotal{},
 		Sources:  map[string]Subtotal{},

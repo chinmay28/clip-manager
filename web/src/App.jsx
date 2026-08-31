@@ -30,6 +30,15 @@ export function App() {
 
   useEffect(() => { refresh() }, [refresh])
 
+  // A stale storage answer is the scan cache's previous walk, served so the
+  // page didn't wait; the fresh walk is running — ask again until the
+  // figures reflect it.
+  useEffect(() => {
+    if (!storage || !storage.stale) return
+    const t = setTimeout(refresh, 2000)
+    return () => clearTimeout(t)
+  }, [storage, refresh])
+
   return (
     <Shell>
       <header style={{
@@ -562,30 +571,43 @@ function ClipBrowser({ onPlay, showSource }) {
 
   // A channel choice re-scopes the day counts; the selected day survives the
   // switch when the new channel recorded that day too, else the newest day
-  // that exists is the only honest default.
+  // that exists is the only honest default. A summary marked stale is the
+  // scan cache's previous walk, served so this render didn't wait — keep
+  // asking until the walk running behind it lands.
   useEffect(() => {
-    let stale = false
-    loadSummary(channel).then((s) => {
-      if (stale || !s) return
+    let cancelled = false
+    let timer = null
+    const load = () => loadSummary(channel).then((s) => {
+      if (cancelled || !s) return
       const days = s.days || []
       setDay((d) => (days.some((row) => row.day === d) ? d : (days[0] ? days[0].day : null)))
+      if (s.stale) timer = setTimeout(load, 2000)
     })
-    return () => { stale = true }
+    load()
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [channel, loadSummary])
 
-  // The day's clips, fetched when the selection settles. Stale responses are
-  // dropped — on a slow link the previous day's answer must not land on top
-  // of the day picked after it.
+  // The day's clips, fetched when the selection settles. Superseded requests
+  // are dropped — on a slow link the previous day's answer must not land on
+  // top of the day picked after it — and a stale answer re-asks, same as the
+  // summary.
   useEffect(() => {
     setClips(null)
     setOpenHours(null)
     if (day == null) return
-    let stale = false
-    api.clips({ day, channel }).then(
-      (c) => { if (!stale) { setClips(c.clips || []); setError(null) } },
-      (e) => { if (!stale) setError(e.message) },
+    let cancelled = false
+    let timer = null
+    const load = () => api.clips({ day, channel }).then(
+      (c) => {
+        if (cancelled) return
+        setClips(c.clips || [])
+        setError(null)
+        if (c.stale) timer = setTimeout(load, 2000)
+      },
+      (e) => { if (!cancelled) setError(e.message) },
     )
-    return () => { stale = true }
+    load()
+    return () => { cancelled = true; clearTimeout(timer) }
   }, [day, channel])
 
   const channels = useMemo(

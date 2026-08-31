@@ -10,6 +10,22 @@ tag that shouldn't be published.
 
 ## Unreleased — the 2026.8 line
 
+### The first load stopped waiting on the walk
+
+Every listing used to walk every source before answering — and one app load
+fires several listings, so opening the app meant walking the archive a few
+times over, slower with every file the cameras add. Listings are now
+answered from a **scan cache**: the last walk's answer, served immediately,
+with a fresh walk running behind it when the snapshot is older than a few
+seconds. The response says which it got (`"stale": true`), and the app
+quietly re-asks until the fresh walk lands — so the footage appears at once
+and corrects itself moments later if anything changed. The snapshot persists
+in the data directory (`scancache.json.gz`), so even a freshly restarted
+server answers its first request from the previous run's walk, and it is
+warmed at startup besides. The walk is still the only truth: quota
+enforcement never reads the cache — footage is deleted only off a fresh walk
+— and a cleanup drops the snapshot so no listing shows clips that are gone.
+
 ### Quotas moved from directories to channels
 
 Per-camera quotas used to key on the first directory under a source — which,

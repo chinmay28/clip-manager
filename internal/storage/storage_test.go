@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/chinmay28/clip-manager/internal/clips"
 )
 
 // writeClip creates a fake recording of a known size and age. Ages are spread
@@ -202,7 +204,8 @@ func TestMeasureReportsMissingSources(t *testing.T) {
 	writeClip(t, a, "cam/a.dav", 100, 10)
 	gone := filepath.Join(a, "unplugged")
 
-	u := Measure([]string{a, gone})
+	list, missing := clips.ScanAll([]string{a, gone})
+	u := Measure([]string{a, gone}, list, missing)
 	if u.Bytes != 100 || len(u.Missing) != 1 || u.Missing[0] != gone {
 		t.Fatalf("want 100 bytes and %s missing, got %+v", gone, u)
 	}
