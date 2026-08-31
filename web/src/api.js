@@ -23,6 +23,11 @@ export const api = {
   removeSource: (path) => request(`/api/sources?path=${encodeURIComponent(path)}`, {
     method: 'DELETE',
   }),
+  setChannelLabel: (channel, label) => request('/api/channels/label', {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channel, label }),
+  }),
   storage: () => request('/api/storage'),
   saveConfig: (config) => request('/api/storage/config', {
     method: 'PUT',
@@ -40,7 +45,10 @@ export const api = {
 export const clipURL = (clip) =>
   `/api/clip?source=${encodeURIComponent(clip.source)}&path=${encodeURIComponent(clip.path)}`
 
-/* The remux stream for formats a browser will not take directly (.dav above
-   all): the server repackages the recording through ffmpeg on the fly. */
-export const playURL = (clip) =>
-  `/api/clip/play?source=${encodeURIComponent(clip.source)}&path=${encodeURIComponent(clip.path)}`
+/* The browser-ready MP4 for formats a browser will not take directly (.dav
+   above all): the server repackages the recording through ffmpeg into a cached,
+   seekable MP4. With transcode set, the video stream is re-encoded to H.264 —
+   the player's fallback for a codec this browser cannot decode. */
+export const playURL = (clip, transcode) =>
+  `/api/clip/play?source=${encodeURIComponent(clip.source)}&path=${encodeURIComponent(clip.path)}` +
+  (transcode ? '&transcode=1' : '')

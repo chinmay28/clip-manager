@@ -10,17 +10,35 @@ tag that shouldn't be published.
 
 ## Unreleased — the 2026.8 line
 
+### Channels, days, and a clean front page
+
+The home page is now the clips and nothing else — the *Sources* and *Storage*
+panels moved to a **Settings** tab. The flat file list is gone: clips are
+grouped into **channels**, read from the recordings' own names
+(`N843A8_ch3_main_…` → channel `N843A8_ch3`, with the camera directory as the
+fallback), and a channel can be **labeled** — select its chip, rename, and
+"N843A8 ch3" becomes "Front door" in every browser, stored in the server's
+config. Within a channel (or across all of them) clips are grouped by **day**
+— *Today*, *Yesterday*, then dates — newest first, each row led by the time
+the recording **started**, parsed from the filename's timestamp rather than
+the upload's mtime.
+
 ### .dav plays in the browser
 
 Formats a browser will not take directly — `.dav` above all — now play in
-place: the server repackages the recording on the fly through the machine's
-own ffmpeg into fragmented MP4, codec copied, never re-encoded, which is
-cheap enough for a Raspberry Pi. The quickstart installs ffmpeg by default
-(`INSTALL_FFMPEG=never` skips it); without one those formats stay labelled
-downloads and the server says so at startup. A stream the browser genuinely
-cannot decode (MJPEG in an old `.avi`) fails in the player as a sentence with
-the download beside it, and the player header now carries a download for
-every clip.
+place: the server repackages the recording through the machine's own ffmpeg
+into a cached, seekable `+faststart` MP4 served with range support — which is
+what iOS Safari requires before it will play a remuxed stream at all (the
+first cut of this feature streamed fragmented MP4, which desktop Chrome
+accepted and iPhones refused). H.264 is container-copied; HEVC is copied and
+tagged `hvc1`, the tag Safari insists on; codecs no browser decodes (MJPEG in
+an old `.avi`) are transcoded to H.264, and the player falls back to a
+server-side H.264 transcode automatically before it ever gives up on a clip.
+Camera audio (usually G.711) is re-encoded to AAC so it survives the MP4.
+Prepared MP4s are cached in the data directory (capped at 512 MB, oldest
+evicted) so a clip is repackaged once, not once per view. The quickstart
+installs ffmpeg by default (`INSTALL_FFMPEG=never` skips it); without one
+those formats stay labelled downloads and the server says so at startup.
 
 ### One or more source directories
 

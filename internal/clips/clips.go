@@ -17,6 +17,7 @@ package clips
 import (
 	"io/fs"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -65,6 +66,67 @@ func RemuxCandidate(ext string) bool {
 	return Extensions[ext] && !playable[ext]
 }
 
+// Filename conventions. Dahua/Amcrest devices name their uploads
+// `<serial>_ch<N>_<stream>_<start>_<end>.dav` — the channel and the recording's
+// start time are in the name, and with FTP layouts that bucket files by date
+// (`<source>/2026-08-30/...`) the name is the only place they are. The
+// patterns below read both out; see channelFromName and startTime.
+var (
+	// channelRe finds a `ch<N>` token and whatever device prefix precedes it:
+	// `N843A8_ch3_main_...` → ("N843A8", "3").
+	channelRe = regexp.MustCompile(`(?i)(?:^|[_-])ch(\d{1,2})(?:[_-]|\.|$)`)
+	// stampRe is a 14-digit YYYYMMDDHHMMSS timestamp. The first one in a
+	// Dahua name is the recording's start; the second is its end.
+	stampRe = regexp.MustCompile(`(20\d{12})`)
+	// dateDirRe / timeNameRe cover the other common layout, an ffmpeg-based
+	// recorder writing `front-door/2026-08-30/12.00.01.mp4`: the date lives
+	// in a path element and the time in the file name.
+	dateDirRe  = regexp.MustCompile(`^(20\d\d)-(\d\d)-(\d\d)$`)
+	timeNameRe = regexp.MustCompile(`^(\d\d)[.:-](\d\d)[.:-](\d\d)\b`)
+)
+
+// channelFromName reads the channel identity out of a file name:
+// `N843A8_ch3_main_...` → `N843A8_ch3`. The device prefix stays in the key so
+// two devices' channel 3s remain two channels. Empty when the name carries no
+// channel token.
+func channelFromName(name string) string {
+	loc := channelRe.FindStringSubmatchIndex(name)
+	if loc == nil {
+		return ""
+	}
+	prefix := strings.Trim(name[:loc[0]], "_-")
+	ch := "ch" + name[loc[2]:loc[3]]
+	if prefix == "" {
+		return ch
+	}
+	return prefix + "_" + ch
+}
+
+// startTime reads the recording's start out of its name (or, failing that, the
+// date directory it sits in), falling back to the file's mod time. The name is
+// preferred because mod time is when the upload finished, which for a slow FTP
+// push can be minutes after the recording — and it does not survive a copy.
+// Timestamps are read in the server's local zone, which is the zone the
+// cameras are configured in whenever both live in the same house.
+func startTime(rel, name string, mod time.Time) time.Time {
+	if m := stampRe.FindString(name); m != "" {
+		if t, err := time.ParseInLocation("20060102150405", m, time.Local); err == nil {
+			return t
+		}
+	}
+	if tm := timeNameRe.FindStringSubmatch(name); tm != nil {
+		for _, elem := range strings.Split(rel, "/") {
+			if dm := dateDirRe.FindStringSubmatch(elem); dm != nil {
+				stamp := dm[1] + dm[2] + dm[3] + tm[1] + tm[2] + tm[3]
+				if t, err := time.ParseInLocation("20060102150405", stamp, time.Local); err == nil {
+					return t
+				}
+			}
+		}
+	}
+	return mod
+}
+
 // A Clip is one recording on disk.
 type Clip struct {
 	// Source is the source directory the clip lives under — one of the
@@ -72,13 +134,24 @@ type Clip struct {
 	// identity: the API takes the pair back to serve or delete the file.
 	Source string `json:"source"`
 	// Path is relative to the clip's source, forward-slashed.
-	Path     string    `json:"path"`
-	Name     string    `json:"name"`
-	Camera   string    `json:"camera"`
-	Ext      string    `json:"ext"`
-	Size     int64     `json:"size"`
-	ModTime  time.Time `json:"mod_time"`
-	Playable bool      `json:"playable"`
+	Path   string `json:"path"`
+	Name   string `json:"name"`
+	Camera string `json:"camera"`
+	// Channel is the recording channel the clip belongs to, read from the
+	// file name (`N843A8_ch3_main_…` → `N843A8_ch3`) with the camera
+	// directory as the fallback — with FTP layouts that bucket files by date,
+	// the name is the only place the channel exists. It is the key the UI
+	// groups by and the one user-given channel labels attach to. Empty when
+	// neither the name nor the layout says.
+	Channel string    `json:"channel"`
+	Ext     string    `json:"ext"`
+	Size    int64     `json:"size"`
+	ModTime time.Time `json:"mod_time"`
+	// StartTime is when the recording started, read from the timestamp in
+	// the file name when there is one, the file's mod time otherwise. It is
+	// the time worth navigating by: mod time is when the upload finished.
+	StartTime time.Time `json:"start_time"`
+	Playable  bool      `json:"playable"`
 	// Remuxable is filled in by the server, not the scan: it means "this
 	// machine's ffmpeg can repackage this for the browser", and only the
 	// server knows whether there is an ffmpeg.
@@ -156,14 +229,20 @@ func Scan(root string) ([]Clip, error) {
 		if i := strings.IndexByte(rel, '/'); i >= 0 {
 			camera = rel[:i]
 		}
+		channel := channelFromName(d.Name())
+		if channel == "" {
+			channel = camera
+		}
 		out = append(out, Clip{
-			Path:     rel,
-			Name:     d.Name(),
-			Camera:   camera,
-			Ext:      ext,
-			Size:     info.Size(),
-			ModTime:  info.ModTime(),
-			Playable: playable[ext],
+			Path:      rel,
+			Name:      d.Name(),
+			Camera:    camera,
+			Channel:   channel,
+			Ext:       ext,
+			Size:      info.Size(),
+			ModTime:   info.ModTime(),
+			StartTime: startTime(rel, d.Name(), info.ModTime()),
+			Playable:  playable[ext],
 		})
 		return nil
 	})

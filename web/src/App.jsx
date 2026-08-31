@@ -3,11 +3,14 @@ import { api, clipURL, playURL } from './api'
 import { COLORS, FONT, formatBytes } from './theme'
 import { Brand, DevMark } from './components/Brand'
 
-/* The app is two answers on one page: what the cameras have recorded, and how
-   much of the disk it is taking. Everything else — playing a clip, drawing a
-   quota, running a cleanup — hangs off one of those two. */
+/* The app is two answers behind two tabs: what the cameras have recorded
+   (home — the clips and nothing else), and how the app is set up (Settings —
+   sources and quotas). Playing a clip hangs off the first; drawing a quota and
+   running a cleanup off the second. */
 export function App() {
+  const [tab, setTab] = useState('clips')
   const [clips, setClips] = useState(null)
+  const [labels, setLabels] = useState({})
   const [storage, setStorage] = useState(null)
   const [sources, setSources] = useState(null)
   const [error, setError] = useState(null)
@@ -17,6 +20,7 @@ export function App() {
     try {
       const [c, s, src] = await Promise.all([api.clips(), api.storage(), api.sources()])
       setClips(c.clips || [])
+      setLabels(c.channel_labels || {})
       setStorage(s)
       setSources(src.sources || [])
       setError(null)
@@ -38,6 +42,10 @@ export function App() {
       }}>
         <Brand />
         <span style={{ flex: 1 }} />
+        <nav style={{ display: 'flex', gap: '4px' }}>
+          <Tab active={tab === 'clips'} onClick={() => setTab('clips')}>Clips</Tab>
+          <Tab active={tab === 'settings'} onClick={() => setTab('settings')}>Settings</Tab>
+        </nav>
         <DevMark />
       </header>
 
@@ -53,18 +61,24 @@ export function App() {
           }}>{error}</div>
         )}
 
-        {sources && storage && (
-          <SourcesPanel sources={sources} usage={storage.usage} onChanged={refresh} />
-        )}
-        {storage && <StoragePanel storage={storage} onChanged={refresh} />}
-        {clips && (
+        {tab === 'clips' && clips && (
           <ClipList
             clips={clips}
+            labels={labels}
             onPlay={setPlaying}
+            onChanged={refresh}
             // Naming the source on every row only earns its ink once there
             // is more than one place a clip could have come from.
             showSource={(sources || []).length > 1}
           />
+        )}
+        {tab === 'settings' && (
+          <>
+            {sources && storage && (
+              <SourcesPanel sources={sources} usage={storage.usage} onChanged={refresh} />
+            )}
+            {storage && <StoragePanel storage={storage} onChanged={refresh} />}
+          </>
         )}
         {!clips && !error && (
           <p style={{ color: COLORS.textMuted }}>Loading…</p>
@@ -73,6 +87,24 @@ export function App() {
 
       {playing && <Player clip={playing} onClose={() => setPlaying(null)} />}
     </Shell>
+  )
+}
+
+function Tab({ active, onClick, children }) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      style={{
+        padding: '7px 14px',
+        borderRadius: '8px',
+        border: `1px solid ${active ? COLORS.accentDim : 'transparent'}`,
+        background: active ? `${COLORS.accent}22` : 'none',
+        color: active ? COLORS.accentBright : COLORS.textDim,
+        fontSize: '14px',
+        cursor: 'pointer',
+      }}
+    >{children}</button>
   )
 }
 
@@ -440,19 +472,61 @@ function EnforceReport({ report, onDismiss }) {
 /* The clips themselves                                                      */
 /* ------------------------------------------------------------------------- */
 
-function ClipList({ clips, onPlay, showSource }) {
-  const [camera, setCamera] = useState(null)
+/* When a recording started, as a Date. The server reads it out of the file
+   name (upload time lies by minutes); mod time is the fallback of last
+   resort. */
+const startOf = (clip) => new Date(clip.start_time || clip.mod_time)
 
-  const cameras = useMemo(
-    () => [...new Set(clips.map((c) => c.camera))].sort(),
+/* The name a channel wears when nobody has labeled it yet: the raw key,
+   readably — "N843A8_ch3" → "N843A8 ch3". */
+const channelFallback = (key) => (key ? key.replace(/_/g, ' ') : 'no channel')
+const channelName = (key, labels) => labels[key] || channelFallback(key)
+
+const sameDay = (a, b) =>
+  a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
+
+/* "Today" and "Yesterday" are how anyone actually thinks about camera
+   footage; every earlier day gets its full name. */
+function dayLabel(date) {
+  const now = new Date()
+  if (sameDay(date, now)) return 'Today'
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+  if (sameDay(date, yesterday)) return 'Yesterday'
+  return date.toLocaleDateString(undefined, {
+    weekday: 'long', year: 'numeric', month: 'short', day: 'numeric',
+  })
+}
+
+/* The clip browser: channels across the top, days down the page. A channel is
+   what the recordings themselves say they belong to (parsed from Dahua-style
+   names, with the camera directory as fallback), and the user can label one
+   with a name that means something — "Front door" instead of "N843A8 ch3". */
+function ClipList({ clips, labels, onPlay, onChanged, showSource }) {
+  const [channel, setChannel] = useState(null)
+
+  const channels = useMemo(
+    () => [...new Set(clips.map((c) => c.channel))].sort(),
     [clips],
   )
-  // Newest first for reading; the API's oldest-first order belongs to
-  // enforcement, not to people.
-  const shown = useMemo(() => {
-    const filtered = camera == null ? clips : clips.filter((c) => c.camera === camera)
-    return [...filtered].reverse()
-  }, [clips, camera])
+
+  // Days newest first, clips newest first within each — by when the
+  // recording started, not when its upload finished. The API's oldest-first
+  // order belongs to enforcement, not to people.
+  const days = useMemo(() => {
+    const filtered = channel == null ? clips : clips.filter((c) => c.channel === channel)
+    const sorted = [...filtered].sort((a, b) => startOf(b) - startOf(a))
+    const out = []
+    for (const clip of sorted) {
+      const date = startOf(clip)
+      const last = out[out.length - 1]
+      if (last && sameDay(last.date, date)) {
+        last.clips.push(clip)
+      } else {
+        out.push({ date, clips: [clip] })
+      }
+    }
+    return out
+  }, [clips, channel])
 
   if (clips.length === 0) {
     return (
@@ -465,28 +539,103 @@ function ClipList({ clips, onPlay, showSource }) {
 
   return (
     <section>
-      {cameras.length > 1 && (
-        <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap', marginBottom: '12px' }}>
-          <Chip active={camera == null} onClick={() => setCamera(null)}>All</Chip>
-          {cameras.map((name) => (
-            <Chip key={name} active={camera === name} onClick={() => setCamera(name)}>
-              {name || 'no camera'}
+      {(channels.length > 1 || channels[0] !== '') && (
+        <div style={{
+          display: 'flex',
+          gap: '6px',
+          flexWrap: 'wrap',
+          alignItems: 'center',
+          marginBottom: '12px',
+        }}>
+          <Chip active={channel == null} onClick={() => setChannel(null)}>All</Chip>
+          {channels.map((key) => (
+            <Chip key={key} active={channel === key} onClick={() => setChannel(key)}>
+              {channelName(key, labels)}
             </Chip>
           ))}
+          {channel != null && channel !== '' && (
+            <ChannelRename channel={channel} label={labels[channel] || ''} onChanged={onChanged} />
+          )}
         </div>
       )}
 
-      <div style={{ borderRadius: '10px', border: `1px solid ${COLORS.border}`, overflow: 'hidden' }}>
-        {shown.map((clip) => (
-          <ClipRow
-            key={`${clip.source}:${clip.path}`}
-            clip={clip}
-            onPlay={onPlay}
-            showSource={showSource}
-          />
-        ))}
-      </div>
+      {days.map(({ date, clips: dayClips }) => (
+        <div key={date.toDateString()} style={{ marginBottom: '18px' }}>
+          <h3 style={{
+            margin: '0 0 8px',
+            fontSize: '13px',
+            fontWeight: 600,
+            color: COLORS.textDim,
+            textTransform: 'uppercase',
+            letterSpacing: '0.04em',
+          }}>
+            {dayLabel(date)}
+            <span style={{ color: COLORS.textMuted, fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>
+              {' '}· {dayClips.length} clip{dayClips.length === 1 ? '' : 's'}
+            </span>
+          </h3>
+          <div style={{ borderRadius: '10px', border: `1px solid ${COLORS.border}`, overflow: 'hidden' }}>
+            {dayClips.map((clip) => (
+              <ClipRow
+                key={`${clip.source}:${clip.path}`}
+                clip={clip}
+                onPlay={onPlay}
+                showSource={showSource}
+                // Inside a filtered channel every row would repeat the chip
+                // above it; only the "All" view needs the name per row.
+                channelName={channel == null ? channelName(clip.channel, labels) : null}
+              />
+            ))}
+          </div>
+        </div>
+      ))}
     </section>
+  )
+}
+
+/* Labeling the selected channel, inline beside its chip: a pencil affordance,
+   an input, done. The label lives in the server's config, so every browser
+   sees the same names. */
+function ChannelRename({ channel, label, onChanged }) {
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState(label)
+  const [busy, setBusy] = useState(false)
+
+  const save = async () => {
+    setBusy(true)
+    try {
+      await api.setChannelLabel(channel, draft.trim())
+      await onChanged()
+      setEditing(false)
+    } catch {
+      // refresh() surfaced the error banner; stay in the editor
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  if (!editing) {
+    return (
+      <button
+        type="button"
+        onClick={() => { setDraft(label); setEditing(true) }}
+        style={buttonStyle()}
+      >✏️ Rename</button>
+    )
+  }
+  return (
+    <span style={{ display: 'inline-flex', gap: '6px', alignItems: 'center' }}>
+      <input
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter') save() }}
+        placeholder={channelFallback(channel)}
+        autoFocus
+        style={{ ...inputStyle, width: '150px', textAlign: 'left' }}
+      />
+      <button type="button" onClick={save} disabled={busy} style={buttonStyle(true)}>Save</button>
+      <button type="button" onClick={() => setEditing(false)} disabled={busy} style={buttonStyle()}>Cancel</button>
+    </span>
   )
 }
 
@@ -508,8 +657,8 @@ function Chip({ active, onClick, children }) {
   )
 }
 
-function ClipRow({ clip, onPlay, showSource }) {
-  const when = new Date(clip.mod_time)
+function ClipRow({ clip, onPlay, showSource, channelName }) {
+  const when = startOf(clip)
   return (
     <div style={{
       display: 'flex',
@@ -526,11 +675,22 @@ function ClipRow({ clip, onPlay, showSource }) {
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
-        }}>{clip.name}</div>
-        <div style={{ color: COLORS.textMuted, fontSize: '12px' }}>
-          {clip.camera && <>{clip.camera} · </>}
-          {showSource && <span title={clip.source}>{baseName(clip.source)} · </span>}
-          {formatBytes(clip.size)} · {when.toLocaleString()}
+        }}>
+          {/* The day is the group header; the time is what tells this clip
+              from its neighbors, so the time leads the row. */}
+          <span style={{ fontFamily: FONT.mono }}>{when.toLocaleTimeString()}</span>
+          {channelName && <span style={{ color: COLORS.textDim }}> · {channelName}</span>}
+        </div>
+        <div style={{
+          color: COLORS.textMuted,
+          fontSize: '12px',
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+        }} title={clip.name}>
+          {formatBytes(clip.size)}
+          {showSource && <> · <span title={clip.source}>{baseName(clip.source)}</span></>}
+          {' · '}{clip.name}
         </div>
       </span>
       {clip.playable || clip.remuxable ? (
@@ -579,14 +739,27 @@ function ClipRow({ clip, onPlay, showSource }) {
 
 /* The player, over everything. Native controls: seeking, volume and
    fullscreen are the browser's job. A natively playable clip is served as-is
-   with range support, so scrubbing works; a remuxed one (.dav) is a live
-   stream out of ffmpeg with no known length, so it plays from the start —
-   which for a clip a few seconds long is the whole clip.
+   with range support; a repackaged one (.dav) is a cached MP4 served the same
+   way — both scrub.
 
-   Failure here is ordinary — a codec this browser lacks, a truncated file —
-   and it must land as a sentence with a way out, not a black rectangle. */
+   Playback failure gets a ladder before it gets a message: the file as-is
+   (when the browser should take it), then the server's remux, then the
+   server's H.264 transcode — the one every browser decodes. Only when all of
+   that fails does the player admit defeat, as a sentence with a way out, not
+   a black rectangle. */
 function Player({ clip, onClose }) {
-  const [failed, setFailed] = useState(false)
+  // Every URL worth trying, in order. Each onError steps down one rung.
+  const attempts = useMemo(() => {
+    const list = []
+    if (clip.playable) list.push(clipURL(clip))
+    if (clip.playable || clip.remuxable) {
+      list.push(playURL(clip))
+      list.push(playURL(clip, true))
+    }
+    return list.length > 0 ? list : [clipURL(clip)]
+  }, [clip])
+  const [attempt, setAttempt] = useState(0)
+  const failed = attempt >= attempts.length
 
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose() }
@@ -636,16 +809,18 @@ function Player({ clip, onClose }) {
             fontSize: '14px',
             textAlign: 'center',
           }}>
-            This clip's video stream is one this browser cannot decode —
-            repackaging changes the container, never the codec. Download it
-            and play it in VLC.
+            This clip would not play even after converting it on the server —
+            the recording may be damaged, or the server has no ffmpeg.
+            Download it and try VLC.
           </div>
         ) : (
           <video
-            src={clip.playable ? clipURL(clip) : playURL(clip)}
+            key={attempts[attempt]}
+            src={attempts[attempt]}
             controls
             autoPlay
-            onError={() => setFailed(true)}
+            playsInline
+            onError={() => setAttempt(attempt + 1)}
             style={{ width: '100%', borderRadius: '8px', background: '#000' }}
           />
         )}

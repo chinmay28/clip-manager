@@ -2,10 +2,12 @@ package server
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -107,5 +109,64 @@ func TestPlayWithoutFFmpegSaysSo(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != 501 {
 		t.Fatalf("want 501 naming the missing tool, got %d", rec.Code)
+	}
+}
+
+func TestChannelLabelRoundTrip(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "N843A8_ch3_main_20260830214636_20260830214641.dav"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, source)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("PUT", "/api/channels/label",
+		strings.NewReader(`{"channel":"N843A8_ch3","label":"Front door"}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("label save: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+
+	// The listing carries the labels back, and the clip carries its channel.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips", nil))
+	var body struct {
+		Clips         []map[string]any  `json:"clips"`
+		ChannelLabels map[string]string `json:"channel_labels"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ChannelLabels["N843A8_ch3"] != "Front door" {
+		t.Fatalf("labels did not round-trip: %v", body.ChannelLabels)
+	}
+	if len(body.Clips) != 1 || body.Clips[0]["channel"] != "N843A8_ch3" {
+		t.Fatalf("clip channel not parsed: %v", body.Clips)
+	}
+
+	// A quota save must not wipe the label (it edits quotas, nothing else).
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("PUT", "/api/storage/config", strings.NewReader(`{"quota_bytes":1024}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("config save: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips", nil))
+	body.ChannelLabels = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.ChannelLabels["N843A8_ch3"] != "Front door" {
+		t.Fatal("a quota save wiped the channel labels")
+	}
+
+	// An empty label forgets the channel's name.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("PUT", "/api/channels/label",
+		strings.NewReader(`{"channel":"N843A8_ch3","label":""}`))
+	s.Handler().ServeHTTP(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("label clear: want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
