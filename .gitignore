@@ -1,0 +1,40 @@
+# Built binaries. These patterns MUST stay anchored to the repo root: a bare
+# `clip` matches any path component with that name, which would silently
+# exclude the whole cmd/clip/ package.
+/clip
+/clip.exe
+/dist/
+
+# Web build
+web/node_modules/
+web/dist/
+
+# Script faces for the wordmark. A licensed webfont covers your own sites
+# rather than redistribution, and a public repository redistributes everything
+# in it — so any face dropped in here stays on the machine that builds.
+#
+# The exception is the one the repository ships: an open-licensed face, cut
+# down to the letters of "Manager" and travelling with its OFL.txt, which is
+# exactly what that licence permits. See web/fonts/README.md.
+web/fonts/*.woff
+web/fonts/*.woff2
+web/fonts/*.otf
+web/fonts/*.ttf
+!web/fonts/wordmark-script.woff2
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+*.test
+coverage.out
+coverage.html
+
+# Footage. Nobody's camera recordings belong in a repository.
+/clips/

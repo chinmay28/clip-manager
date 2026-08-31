@@ -1,0 +1,47 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Paints the phone's own browser chrome to match the app rather than
+         leaving a white bar above a dark page. -->
+    <meta name="theme-color" content="#0a0e17" />
+    <title>Clip Manager — camera clips, kept in budget</title>
+    <!--
+      Nothing is fetched from anywhere. The app is served entirely from the
+      local binary: linking a webfont would announce every time you check your
+      cameras to a third party. Typography is whatever the system provides;
+      the one embedded exception is the wordmark's script face, inlined as a
+      data: URI by the build (see web/vite.config.js) rather than linked.
+    -->
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+
+    <!--
+      Added to a phone's home screen, the app gets its own icon and opens
+      without browser chrome, like the app it behaves as. The two platforms ask
+      for that in different dialects and neither reads the other's, so both are
+      declared here.
+
+      Android reads the manifest — named .json rather than .webmanifest so the
+      Go file server answers with a JSON content type from its built-in table
+      instead of whatever the host's mime.types happens to know.
+
+      iOS reads none of it: it takes the icon from apple-touch-icon (a raster
+      image only — it will not take the SVG above), the home-screen label from
+      apple-mobile-web-app-title, and standalone launch from the -capable flag.
+      The black status bar style is the one that keeps white text over a dark
+      app without moving content up under the clock.
+    -->
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-title" content="Clip Manager" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+    <script type="module" crossorigin src="/assets/index-wEQGNLZc.js"></script>
+    <style>@font-face{font-family:'Caveat';src:url(data:font/woff2;base64,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) format('woff2');font-weight:400;font-style:normal;font-display:swap;}</style>
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>
