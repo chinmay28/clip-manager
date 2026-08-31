@@ -205,7 +205,7 @@ func cmdPrune(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if cfg.QuotaBytes <= 0 && len(cfg.CameraQuotaBytes) == 0 {
+	if cfg.QuotaBytes <= 0 && len(cfg.ChannelQuotaBytes) == 0 {
 		fmt.Println("no quota configured — nothing to enforce")
 		return
 	}

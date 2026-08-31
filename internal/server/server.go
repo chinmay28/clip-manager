@@ -748,9 +748,9 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "quota_bytes cannot be negative")
 		return
 	}
-	for name, q := range cfg.CameraQuotaBytes {
+	for name, q := range cfg.ChannelQuotaBytes {
 		if q < 0 {
-			httpError(w, http.StatusBadRequest, "camera %q: quota cannot be negative", name)
+			httpError(w, http.StatusBadRequest, "channel %q: quota cannot be negative", name)
 			return
 		}
 	}

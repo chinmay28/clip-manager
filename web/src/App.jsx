@@ -218,9 +218,10 @@ function SourcesPanel({ sources, usage, onChanged }) {
         </button>
       </div>
       <p style={{ color: COLORS.textMuted, fontSize: '12px', margin: '8px 0 0' }}>
-        An absolute path on the machine the server runs on, laid out one
-        subdirectory per camera. Removing a source deletes nothing — it only
-        takes the directory out of view and out from under the quotas.
+        An absolute path on the machine the server runs on — one subdirectory
+        per camera, or date-bucketed FTP uploads whose file names carry the
+        channel. Removing a source deletes nothing — it only takes the
+        directory out of view and out from under the quotas.
       </p>
 
       {error && <p style={{ color: COLORS.error, fontSize: '13px', margin: '10px 0 0' }}>{error}</p>}
@@ -243,13 +244,19 @@ const fromGB = (text) => {
   return Number.isFinite(v) && v > 0 ? Math.round(v * GB) : 0
 }
 
+/* Per-channel quotas key on the channel identity ("N843A8_ch3") — the same
+   thing the Clips tab groups by and labels attach to — so "Front door keeps
+   10 GB, Backyard keeps 5" works even when the recorder buckets files by date
+   and the channel lives only in the file names. The label is the row's face;
+   the raw key beside it is what the line is actually drawn on. */
 function StoragePanel({ storage, onChanged }) {
   const { usage, config } = storage
+  const labels = config.channel_labels || {}
   const [quotaGB, setQuotaGB] = useState(toGB(config.quota_bytes))
-  const [cameraGB, setCameraGB] = useState(() => {
+  const [channelGB, setChannelGB] = useState(() => {
     const init = {}
-    for (const [name, q] of Object.entries(config.camera_quota_bytes || {})) {
-      init[name] = toGB(q)
+    for (const [key, q] of Object.entries(config.channel_quota_bytes || {})) {
+      init[key] = toGB(q)
     }
     return init
   })
@@ -257,18 +264,18 @@ function StoragePanel({ storage, onChanged }) {
   const [report, setReport] = useState(null)
   const [error, setError] = useState(null)
 
-  const cameras = Object.keys(usage.cameras || {}).sort()
+  const channels = Object.keys(usage.channels || {}).sort()
 
   const save = async () => {
     setBusy(true)
     setError(null)
     try {
-      const camera_quota_bytes = {}
-      for (const [name, text] of Object.entries(cameraGB)) {
+      const channel_quota_bytes = {}
+      for (const [key, text] of Object.entries(channelGB)) {
         const bytes = fromGB(text)
-        if (bytes > 0) camera_quota_bytes[name] = bytes
+        if (bytes > 0) channel_quota_bytes[key] = bytes
       }
-      await api.saveConfig({ quota_bytes: fromGB(quotaGB), camera_quota_bytes })
+      await api.saveConfig({ quota_bytes: fromGB(quotaGB), channel_quota_bytes })
       await onChanged()
     } catch (e) {
       setError(e.message)
@@ -332,7 +339,7 @@ function StoragePanel({ storage, onChanged }) {
         flexWrap: 'wrap',
       }}>
         <label style={{ fontSize: '13px', color: COLORS.textDim }}>
-          Directory quota{' '}
+          Total quota{' '}
           <input
             value={quotaGB}
             onChange={(e) => setQuotaGB(e.target.value)}
@@ -353,36 +360,45 @@ function StoragePanel({ storage, onChanged }) {
         </button>
       </div>
 
-      {cameras.length > 0 && (
+      {channels.length > 0 && (
         <table style={{ width: '100%', marginTop: '14px', borderCollapse: 'collapse', fontSize: '13px' }}>
           <tbody>
-            {cameras.map((name) => {
-              const cu = usage.cameras[name]
+            {channels.map((key) => {
+              const cu = usage.channels[key]
+              const quotaBytes = (config.channel_quota_bytes || {})[key]
               return (
-                <tr key={name} style={{ borderTop: `1px solid ${COLORS.border}` }}>
+                <tr key={key} style={{ borderTop: `1px solid ${COLORS.border}` }}>
                   <td style={{ padding: '7px 8px 7px 0', color: COLORS.text }}>
-                    {name || <em style={{ color: COLORS.textMuted }}>no camera</em>}
+                    {key === '' ? <em style={{ color: COLORS.textMuted }}>no channel</em>
+                      : channelName(key, labels)}
+                    {labels[key] && (
+                      /* The label names the row; the key it is drawn on
+                         stays visible, muted — a quota that follows a
+                         renamed channel should look like it does. */
+                      <span style={{
+                        color: COLORS.textMuted,
+                        marginLeft: '8px',
+                        fontFamily: FONT.mono,
+                        fontSize: '11px',
+                      }}>{key}</span>
+                    )}
                   </td>
                   <td style={{ padding: '7px 8px', color: COLORS.textDim, fontFamily: FONT.mono }}>
                     {formatBytes(cu.bytes)}
                     <span style={{ color: COLORS.textMuted }}> · {cu.files}</span>
-                  </td>
-                  <td style={{ padding: '7px 0', textAlign: 'right', color: COLORS.textDim }}>
-                    {/* Files with no camera directory have no directory a
-                        per-camera quota could meter — only the global line
-                        covers them. */}
-                    {name && (
-                      <>
-                        quota{' '}
-                        <input
-                          value={cameraGB[name] ?? ''}
-                          onChange={(e) => setCameraGB({ ...cameraGB, [name]: e.target.value })}
-                          placeholder="none"
-                          inputMode="decimal"
-                          style={inputStyle}
-                        /> GB
-                      </>
+                    {quotaBytes > 0 && cu.bytes > quotaBytes && (
+                      <span style={{ color: COLORS.warn, fontFamily: FONT.sans }}> over</span>
                     )}
+                  </td>
+                  <td style={{ padding: '7px 0', textAlign: 'right', color: COLORS.textDim, whiteSpace: 'nowrap' }}>
+                    quota{' '}
+                    <input
+                      value={channelGB[key] ?? ''}
+                      onChange={(e) => setChannelGB({ ...channelGB, [key]: e.target.value })}
+                      placeholder="none"
+                      inputMode="decimal"
+                      style={inputStyle}
+                    /> GB
                   </td>
                 </tr>
               )
