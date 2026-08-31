@@ -1,10 +1,13 @@
 // Package server is the HTTP half of the app: a JSON API over the clips
 // directory and the quota policy, and the embedded web client in front of it.
 //
-// The server holds no state of its own. The clips directory is read fresh on
-// every listing (see internal/clips), and the quota config is one JSON file in
-// the data directory — so the API answers with the truth on disk, and two
-// instances pointed at the same directory cannot disagree.
+// The server holds no record of its own. The quota config is one JSON file
+// in the data directory, and every listing is the clips directory itself by
+// way of the scan cache (see clips.Cache): the last walk's answer served
+// immediately, a fresh walk running behind a stale one, and the response
+// saying which it got — so the API answers with the truth on disk, at worst
+// a marked few-seconds-old copy of it, and everything cached can be thrown
+// away without losing anything but a head start.
 package server
 
 import (
@@ -55,6 +58,11 @@ type Server struct {
 	// a cached MP4. Found once at startup — a tool appearing mid-flight is a
 	// restart, not a poll.
 	FFmpeg string
+	// ScanCache, when set, answers listings from the last walk while the
+	// next one runs (see clips.Cache). Nil means every listing walks fresh —
+	// the tests' arrangement. Enforcement never reads it either way:
+	// deleting footage acts only on a fresh walk.
+	ScanCache *clips.Cache
 
 	// mu serialises config writes and enforcement runs. Listings do not take
 	// it — they read the directories, which is safe beside a delete.
@@ -106,6 +114,31 @@ func (s *Server) sources() ([]string, error) {
 	return out, nil
 }
 
+// listing is every clip under the sources, through the scan cache when there
+// is one. stale=true means the answer is the previous walk's and a rescan is
+// underway — the response carries the flag so the client asks again until it
+// clears, which is what makes the first load instant instead of a wait on
+// the walk.
+func (s *Server) listing(srcs []string) (list []clips.Clip, missing []string, stale bool) {
+	if s.ScanCache == nil {
+		list, missing = clips.ScanAll(srcs)
+		return list, missing, false
+	}
+	return s.ScanCache.Listing(srcs)
+}
+
+// WarmScanCache primes the scan cache — called in the background at startup,
+// so the walk (or the previous run's persisted snapshot) is already in hand
+// by the time the first browser arrives.
+func (s *Server) WarmScanCache() {
+	if s.ScanCache == nil {
+		return
+	}
+	if srcs, err := s.sources(); err == nil {
+		s.ScanCache.Listing(srcs)
+	}
+}
+
 func (s *Server) pinned(src string) bool {
 	for _, p := range s.PinnedSources {
 		if filepath.Clean(p) == src {
@@ -148,7 +181,13 @@ func (s *Server) enforce(dryRun bool) (storage.Report, error) {
 	if err != nil {
 		return storage.Report{}, err
 	}
-	return storage.Enforce(srcs, cfg, dryRun)
+	report, err := storage.Enforce(srcs, cfg, dryRun)
+	if err == nil && !dryRun && len(report.Deleted) > 0 && s.ScanCache != nil {
+		// The listings must reflect the deletions at once — a snapshot that
+		// still shows removed footage would read as the cleanup having lied.
+		s.ScanCache.Invalidate()
+	}
+	return report, err
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
@@ -180,7 +219,7 @@ func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "reading sources: %v", err)
 		return
 	}
-	list, missing := clips.ScanAll(srcs)
+	list, missing, stale := s.listing(srcs)
 
 	q := r.URL.Query()
 	if day := q.Get("day"); day != "" {
@@ -212,7 +251,7 @@ func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 	if labels == nil {
 		labels = map[string]string{}
 	}
-	writeJSON(w, map[string]any{"clips": list, "missing_sources": missing, "channel_labels": labels})
+	writeJSON(w, map[string]any{"clips": list, "missing_sources": missing, "channel_labels": labels, "stale": stale})
 }
 
 func filterClips(list []clips.Clip, keep func(clips.Clip) bool) []clips.Clip {
@@ -240,7 +279,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "reading sources: %v", err)
 		return
 	}
-	list, missing := clips.ScanAll(srcs)
+	list, missing, stale := s.listing(srcs)
 
 	type bucket struct {
 		Clips int   `json:"clips"`
@@ -298,6 +337,7 @@ func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
 		"days":            days,
 		"channel_labels":  labels,
 		"missing_sources": missing,
+		"stale":           stale,
 	})
 }
 
@@ -735,7 +775,8 @@ func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
 		return
 	}
-	writeJSON(w, map[string]any{"usage": storage.Measure(srcs), "config": cfg})
+	list, missing, stale := s.listing(srcs)
+	writeJSON(w, map[string]any{"usage": storage.Measure(srcs, list, missing), "config": cfg, "stale": stale})
 }
 
 func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
@@ -748,9 +789,9 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusBadRequest, "quota_bytes cannot be negative")
 		return
 	}
-	for name, q := range cfg.CameraQuotaBytes {
+	for name, q := range cfg.ChannelQuotaBytes {
 		if q < 0 {
-			httpError(w, http.StatusBadRequest, "camera %q: quota cannot be negative", name)
+			httpError(w, http.StatusBadRequest, "channel %q: quota cannot be negative", name)
 			return
 		}
 	}

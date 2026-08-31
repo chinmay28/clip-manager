@@ -3,8 +3,11 @@ package storage
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/chinmay28/clip-manager/internal/clips"
 )
 
 // writeClip creates a fake recording of a known size and age. Ages are spread
@@ -47,22 +50,49 @@ func TestEnforceDeletesOldestFirstUnderGlobalQuota(t *testing.T) {
 	}
 }
 
-func TestEnforceCameraQuotaSparesOtherCameras(t *testing.T) {
+func TestEnforceChannelQuotaSparesOtherChannels(t *testing.T) {
+	// One directory per camera, no channel token in the names: the camera
+	// directory IS the channel, so this is also the per-camera case.
 	root := t.TempDir()
 	writeClip(t, root, "noisy/a.dav", 100, 40)
 	writeClip(t, root, "noisy/b.dav", 100, 30)
 	writeClip(t, root, "quiet/old.dav", 100, 50) // oldest of all, but under its own line
 
-	cfg := Config{CameraQuotaBytes: map[string]int64{"noisy": 100}}
+	cfg := Config{ChannelQuotaBytes: map[string]int64{"noisy": 100}}
 	report, err := Enforce([]string{root}, cfg, false)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(report.Deleted) != 1 || report.Deleted[0].Path != "noisy/a.dav" || report.Deleted[0].Rule != "camera" {
-		t.Fatalf("want noisy/a.dav via the camera rule, got %+v", report.Deleted)
+	if len(report.Deleted) != 1 || report.Deleted[0].Path != "noisy/a.dav" || report.Deleted[0].Rule != "channel" {
+		t.Fatalf("want noisy/a.dav via the channel rule, got %+v", report.Deleted)
 	}
 	if !exists(root, "quiet/old.dav") {
-		t.Fatal("a camera quota deleted another camera's footage")
+		t.Fatal("a channel quota deleted another channel's footage")
+	}
+}
+
+func TestEnforceChannelQuotaSpansDateDirectories(t *testing.T) {
+	// The FTP layout that made directory-keyed quotas useless: files
+	// bucketed by date, the channel living only in the Dahua-style names.
+	// A quota on one channel must follow it across the date directories and
+	// leave the other channel alone.
+	root := t.TempDir()
+	writeClip(t, root, "2026-08-30/N843A8_ch3_main_20260830120000_20260830120100.dav", 100, 40)
+	writeClip(t, root, "2026-08-31/N843A8_ch3_main_20260831120000_20260831120100.dav", 100, 30)
+	writeClip(t, root, "2026-08-30/N843A8_ch5_main_20260830110000_20260830110100.dav", 100, 50)
+
+	cfg := Config{ChannelQuotaBytes: map[string]int64{"N843A8_ch3": 100}}
+	report, err := Enforce([]string{root}, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Deleted) != 1 ||
+		report.Deleted[0].Path != "2026-08-30/N843A8_ch3_main_20260830120000_20260830120100.dav" ||
+		report.Deleted[0].Channel != "N843A8_ch3" {
+		t.Fatalf("want the channel's oldest clip across date dirs, got %+v", report.Deleted)
+	}
+	if !exists(root, "2026-08-30/N843A8_ch5_main_20260830110000_20260830110100.dav") {
+		t.Fatal("a channel quota deleted another channel's footage")
 	}
 }
 
@@ -133,14 +163,14 @@ func TestEnforceGlobalQuotaSpansSources(t *testing.T) {
 	}
 }
 
-func TestEnforceCameraQuotaMergesAcrossSources(t *testing.T) {
-	// The same camera name under two sources is one camera to its quota:
+func TestEnforceChannelQuotaMergesAcrossSources(t *testing.T) {
+	// The same channel under two sources is one channel to its quota:
 	// the oldest of its footage goes first, whichever source holds it.
 	a, b := t.TempDir(), t.TempDir()
 	writeClip(t, a, "front/old.dav", 100, 40)
 	writeClip(t, b, "front/new.dav", 100, 10)
 
-	cfg := Config{CameraQuotaBytes: map[string]int64{"front": 100}}
+	cfg := Config{ChannelQuotaBytes: map[string]int64{"front": 100}}
 	report, err := Enforce([]string{a, b}, cfg, false)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +204,8 @@ func TestMeasureReportsMissingSources(t *testing.T) {
 	writeClip(t, a, "cam/a.dav", 100, 10)
 	gone := filepath.Join(a, "unplugged")
 
-	u := Measure([]string{a, gone})
+	list, missing := clips.ScanAll([]string{a, gone})
+	u := Measure([]string{a, gone}, list, missing)
 	if u.Bytes != 100 || len(u.Missing) != 1 || u.Missing[0] != gone {
 		t.Fatalf("want 100 bytes and %s missing, got %+v", gone, u)
 	}
@@ -192,7 +223,7 @@ func TestConfigRoundTrip(t *testing.T) {
 		t.Fatalf("missing config: got %+v, %v", cfg, err)
 	}
 
-	want := Config{QuotaBytes: 1 << 30, CameraQuotaBytes: map[string]int64{"front": 1 << 20}}
+	want := Config{QuotaBytes: 1 << 30, ChannelQuotaBytes: map[string]int64{"N843A8_ch3": 1 << 20}}
 	if err := Save(path, want); err != nil {
 		t.Fatal(err)
 	}
@@ -200,7 +231,38 @@ func TestConfigRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.QuotaBytes != want.QuotaBytes || got.CameraQuotaBytes["front"] != want.CameraQuotaBytes["front"] {
+	if got.QuotaBytes != want.QuotaBytes || got.ChannelQuotaBytes["N843A8_ch3"] != want.ChannelQuotaBytes["N843A8_ch3"] {
 		t.Fatalf("round trip lost data: %+v", got)
+	}
+}
+
+func TestLoadMigratesCameraQuotas(t *testing.T) {
+	// A config written before quotas moved to channels: its camera keys must
+	// come back as channel quotas — for one-directory-per-camera layouts the
+	// directory name is the channel fallback, so the line lands where it
+	// always was — and the next save must write only the new key.
+	path := filepath.Join(t.TempDir(), "config.json")
+	old := `{"quota_bytes": 500, "camera_quota_bytes": {"front": 100}}`
+	if err := os.WriteFile(path, []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.ChannelQuotaBytes["front"] != 100 || cfg.LegacyCameraQuotaBytes != nil {
+		t.Fatalf("want the camera quota folded into channels, got %+v", cfg)
+	}
+
+	if err := Save(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "channel_quota_bytes") || strings.Contains(string(data), "camera_quota_bytes") {
+		t.Fatalf("the migrated config should persist under the new key only:\n%s", data)
 	}
 }

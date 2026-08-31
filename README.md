@@ -31,8 +31,11 @@ clips a day**: drill down by **channel** (read from the recordings' own
 filenames, labelable to names that mean something), then by **day** on a
 scrollable strip with per-day counts, then by collapsible **hour**. Each row
 is led by when the recording started. Only the chosen day's clips are ever
-fetched — the menus are drawn from a lightweight summary API. Sources and
-quotas live behind the **Settings** tab.
+fetched — the menus are drawn from a lightweight summary API — and every
+listing is answered instantly from the **scan cache**: the last walk's
+answer (persisted across restarts), served while a fresh walk runs behind
+it, with the response marked `stale` so the app quietly re-asks until the
+walk lands. Sources and quotas live behind the **Settings** tab.
 
 ---
 
@@ -139,8 +142,10 @@ footage/
 └── backyard/…
 ```
 
-A file directly in a source's root belongs to no camera; it is listed, and
-covered by the total quota, but a per-camera quota has nothing to meter it by.
+Recorders that bucket files by date instead (`192.168.2.193/2026-08-30/…`,
+the way Dahua/Amcrest/Lorex FTP uploads land) work too: the channel each clip
+belongs to is read from the file's own name, and that channel is what the
+per-channel quotas and the app's grouping key on.
 
 ## Sources
 
@@ -177,16 +182,28 @@ Two kinds of line can be drawn, both in the app (or by editing
 `config.json` in the data directory):
 
 - a **total quota** — how much footage all the sources together may hold
-- a **per-camera quota** — how much one camera may hold. The camera's *name*
-  is its identity: the same directory name under two sources is one camera to
-  its quota, deliberately, so a camera whose footage is split across a disk
-  and its overflow still answers to one line.
+- a **per-channel quota** — how much one channel may hold: "the front door
+  keeps 10 GB, the backyard 5". The *channel* is the identity the clips
+  themselves carry (`N843A8_ch3_main_…` → `N843A8_ch3`, with the camera
+  directory as the fallback when the names carry no channel token), which is
+  what makes the line meaningful on every layout — including FTP uploads
+  bucketed by date, where the camera is in the file name and nowhere else.
+  The same channel under two sources is one channel to its quota,
+  deliberately, so footage split across a disk and its overflow still answers
+  to one line. Labeling a channel ("Front door") renames its face everywhere;
+  the quota stays drawn on the channel underneath, so a rename never moves a
+  line.
 
 When a line is crossed, enforcement deletes the **oldest footage first,
 across every source** — the oldest goes first wherever it sits — until the
-figure is back under it. Camera quotas run before the global one, so a camera
-over its own line pays for itself before well-behaved cameras lose anything
-to the shared total.
+figure is back under it. Channel quotas run before the global one, so a
+channel over its own line pays for itself before well-behaved channels lose
+anything to the shared total.
+
+(Configs from older versions that drew `camera_quota_bytes` lines are read
+and folded into the channel quotas on load — for one-directory-per-camera
+layouts the directory name is the channel, so the line lands where it always
+was.)
 
 What keeps this safe to run unattended:
 
@@ -203,6 +220,10 @@ What keeps this safe to run unattended:
 - **Dry run first.** *Preview cleanup* in the app, `clip prune --dry-run` from
   the shell, or `POST /api/storage/enforce?dry_run=1` — all answer "what would
   go" without touching anything.
+- **Never off a cache.** Enforcement always walks the directories fresh —
+  the scan cache that makes listings instant is never what footage is
+  deleted against, and it is dropped after a cleanup so no listing shows
+  clips that are gone.
 
 Enforcement runs hourly under `serve` (`--enforce-every` changes it, `0`
 disables it), on demand from the app, and as a one-shot from the shell —
@@ -263,9 +284,16 @@ usable from a script:
 | `GET /api/sources` | the source set: path, pinned, available |
 | `POST /api/sources` | add a source `{path}` — must exist and be absolute |
 | `DELETE /api/sources?path=…` | forget a runtime-added source (files untouched; pinned ones refuse) |
-| `GET /api/storage` | usage (total, per camera, per source) + the current quota config |
+| `GET /api/storage` | usage (total, per channel, per source) + the current quota config |
 | `PUT /api/storage/config` | replace the quota config (sources are untouched — they have their own endpoints) |
 | `POST /api/storage/enforce` | run enforcement now; `?dry_run=1` to only report |
+
+Listing responses (`/api/clips`, `/api/summary`, `/api/storage`) carry
+`"stale": true` when answered from the scan cache while a rescan runs behind
+them — ask again shortly and the flag clears once the fresh walk lands. The
+snapshot lives in the data directory (`scancache.json.gz`) beside the config
+and the play cache; deleting it costs nothing but the next start's head
+start.
 
 ---
 
@@ -323,7 +351,7 @@ the full commit graph (`fetch-depth: 0`, or `--filter=blob:none` rather than
 clip-manager/
 ├── cmd/clip/                    # CLI: serve, prune, version
 ├── internal/
-│   ├── clips/                   # the directory walk: clips, cameras, playability
+│   ├── clips/                   # the directory walk: clips, channels, playability, the scan cache
 │   ├── storage/                 # quotas: config, usage, oldest-first enforcement
 │   ├── server/                  # JSON API + embedded SPA (dist/ is committed)
 │   └── version/                 # YEAR/MONTH; PATCH stamped at link time

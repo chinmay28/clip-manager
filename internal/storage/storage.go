@@ -5,9 +5,9 @@
 // Two kinds of line can be drawn:
 //
 //   - a global quota — how much the whole clips directory may hold
-//   - a per-camera quota — how much one camera's subdirectory may hold
+//   - a per-channel quota — how much one channel's footage may hold
 //
-// Enforcement deletes oldest-first, camera quotas before the global one, and
+// Enforcement deletes oldest-first, channel quotas before the global one, and
 // only files whose extension internal/clips recognises as footage — a config
 // file, a thumbnail cache or anything else living in the directory is never
 // eligible. Deleting recordings unattended is the most dangerous thing this
@@ -31,12 +31,24 @@ import (
 type Config struct {
 	// QuotaBytes caps the footage total across every source. 0 = unlimited.
 	QuotaBytes int64 `json:"quota_bytes"`
-	// CameraQuotaBytes caps individual cameras, keyed by the camera's
-	// directory name. 0 or absent = unlimited for that camera. The same
-	// name under two sources is one camera to its quota — the name is the
-	// identity, deliberately, so a camera whose footage is split across a
-	// disk and its overflow still answers to one line.
-	CameraQuotaBytes map[string]int64 `json:"camera_quota_bytes,omitempty"`
+	// ChannelQuotaBytes caps individual channels, keyed by the channel
+	// identity internal/clips reads from the recordings themselves
+	// ("N843A8_ch3"), with the camera directory as the fallback for files
+	// whose names carry no channel token. 0 or absent = unlimited for that
+	// channel. The channel is the identity, deliberately: it survives FTP
+	// layouts that bucket files by date instead of by camera, and the same
+	// channel under two sources is one channel to its quota, so footage
+	// split across a disk and its overflow still answers to one line.
+	//
+	// Quotas key on the channel, never on its user-given label — a label
+	// can be set, changed or dropped without moving any line.
+	ChannelQuotaBytes map[string]int64 `json:"channel_quota_bytes,omitempty"`
+	// LegacyCameraQuotaBytes is the quota's old shape — keyed by the camera
+	// directory, before channels existed. Load folds it into
+	// ChannelQuotaBytes (for one-directory-per-camera layouts the directory
+	// name IS the channel fallback, so the line lands where it always was)
+	// and clears it, so a save writes only the new key.
+	LegacyCameraQuotaBytes map[string]int64 `json:"camera_quota_bytes,omitempty"`
 	// Sources are the clip directories added at runtime (through the app),
 	// alongside whatever the command line pinned. Absolute paths.
 	Sources []string `json:"sources,omitempty"`
@@ -61,6 +73,18 @@ func Load(path string) (Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return cfg, fmt.Errorf("%s: %w", path, err)
 	}
+	// A config written before quotas moved to channels carries
+	// camera_quota_bytes. Fold it in rather than dropping it: a quota
+	// someone drew must never silently stop enforcing across an upgrade.
+	for name, q := range cfg.LegacyCameraQuotaBytes {
+		if cfg.ChannelQuotaBytes == nil {
+			cfg.ChannelQuotaBytes = map[string]int64{}
+		}
+		if _, drawn := cfg.ChannelQuotaBytes[name]; !drawn {
+			cfg.ChannelQuotaBytes[name] = q
+		}
+	}
+	cfg.LegacyCameraQuotaBytes = nil
 	return cfg, nil
 }
 
@@ -82,18 +106,19 @@ func Save(path string, cfg Config) error {
 	return os.Rename(tmp, path)
 }
 
-// CameraUsage is one camera's share of the directory.
-type CameraUsage struct {
+// Subtotal is one bucket's share of the directory — a channel's, or a
+// source's.
+type Subtotal struct {
 	Bytes int64 `json:"bytes"`
 	Files int   `json:"files"`
 }
 
-// Usage is what the sources hold, in total, per camera, and per source.
+// Usage is what the sources hold, in total, per channel, and per source.
 type Usage struct {
-	Bytes   int64                  `json:"bytes"`
-	Files   int                    `json:"files"`
-	Cameras map[string]CameraUsage `json:"cameras"`
-	Sources map[string]CameraUsage `json:"sources"`
+	Bytes    int64               `json:"bytes"`
+	Files    int                 `json:"files"`
+	Channels map[string]Subtotal `json:"channels"`
+	Sources  map[string]Subtotal `json:"sources"`
 	// Missing names the sources that could not be read at all — an
 	// unplugged drive, a NAS that is down. Their footage is not in the
 	// figures above, which is worth saying out loud: a total that silently
@@ -101,29 +126,28 @@ type Usage struct {
 	Missing []string `json:"missing,omitempty"`
 }
 
-// Measure totals the clips under every source. It counts what internal/clips
-// counts — footage — so the figure is the one quotas are compared against,
-// not a disk `du` that would include foreign files enforcement will never
-// delete.
-func Measure(sources []string) Usage {
-	list, missing := clips.ScanAll(sources)
+// Measure totals a listing of the sources' clips — the walk's own output
+// (clips.ScanAll or the scan cache's Listing), which is what keeps the
+// figure the one quotas are compared against: footage, not a disk `du` that
+// would include foreign files enforcement will never delete.
+func Measure(sources []string, list []clips.Clip, missing []string) Usage {
 	u := Usage{
-		Cameras: map[string]CameraUsage{},
-		Sources: map[string]CameraUsage{},
-		Missing: missing,
+		Channels: map[string]Subtotal{},
+		Sources:  map[string]Subtotal{},
+		Missing:  missing,
 	}
 	for _, src := range sources {
 		if !contains(missing, src) {
-			u.Sources[src] = CameraUsage{} // a readable, empty source is a row, not an absence
+			u.Sources[src] = Subtotal{} // a readable, empty source is a row, not an absence
 		}
 	}
 	for _, c := range list {
 		u.Bytes += c.Size
 		u.Files++
-		cu := u.Cameras[c.Camera]
+		cu := u.Channels[c.Channel]
 		cu.Bytes += c.Size
 		cu.Files++
-		u.Cameras[c.Camera] = cu
+		u.Channels[c.Channel] = cu
 		su := u.Sources[c.Source]
 		su.Bytes += c.Size
 		su.Files++
@@ -144,11 +168,11 @@ func contains(list []string, v string) bool {
 // Deleted is one file enforcement removed (or, on a dry run, would remove),
 // and which line it crossed.
 type Deleted struct {
-	Source string `json:"source"`
-	Path   string `json:"path"`
-	Camera string `json:"camera"`
-	Size   int64  `json:"size"`
-	// Rule is "camera" when a per-camera quota claimed the file, "global"
+	Source  string `json:"source"`
+	Path    string `json:"path"`
+	Channel string `json:"channel"`
+	Size    int64  `json:"size"`
+	// Rule is "channel" when a per-channel quota claimed the file, "global"
 	// when the directory-wide one did.
 	Rule string `json:"rule"`
 }
@@ -166,8 +190,8 @@ type Report struct {
 
 // Enforce brings the sources back under the quotas by deleting the oldest
 // footage first — across every source, so the oldest goes first wherever it
-// sits. Camera quotas run before the global one, so a camera over its own
-// line pays for itself before well-behaved cameras lose anything to the
+// sits. Channel quotas run before the global one, so a channel over its own
+// line pays for itself before well-behaved channels lose anything to the
 // shared total.
 //
 // A source that cannot be read contributes nothing to the totals and nothing
@@ -180,17 +204,17 @@ type Report struct {
 // never invents a line nobody drew.
 func Enforce(sources []string, cfg Config, dryRun bool) (Report, error) {
 	report := Report{DryRun: dryRun, Deleted: []Deleted{}}
-	if cfg.QuotaBytes <= 0 && len(cfg.CameraQuotaBytes) == 0 {
+	if cfg.QuotaBytes <= 0 && len(cfg.ChannelQuotaBytes) == 0 {
 		return report, nil
 	}
 
 	list, _ := clips.ScanAll(sources) // oldest first — the order deletion consumes
 
 	total := int64(0)
-	perCamera := map[string]int64{}
+	perChannel := map[string]int64{}
 	for _, c := range list {
 		total += c.Size
-		perCamera[c.Camera] += c.Size
+		perChannel[c.Channel] += c.Size
 	}
 	gone := map[string]bool{}
 	key := func(c clips.Clip) string { return c.Source + "\x00" + c.Path }
@@ -204,20 +228,20 @@ func Enforce(sources []string, cfg Config, dryRun bool) (Report, error) {
 		}
 		gone[key(c)] = true
 		total -= c.Size
-		perCamera[c.Camera] -= c.Size
+		perChannel[c.Channel] -= c.Size
 		report.FreedBytes += c.Size
 		report.Deleted = append(report.Deleted, Deleted{
-			Source: c.Source, Path: c.Path, Camera: c.Camera, Size: c.Size, Rule: rule,
+			Source: c.Source, Path: c.Path, Channel: c.Channel, Size: c.Size, Rule: rule,
 		})
 	}
 
-	// Per-camera lines first, oldest first within each camera.
+	// Per-channel lines first, oldest first within each channel.
 	for _, c := range list {
-		quota := cfg.CameraQuotaBytes[c.Camera]
-		if quota <= 0 || perCamera[c.Camera] <= quota {
+		quota := cfg.ChannelQuotaBytes[c.Channel]
+		if quota <= 0 || perChannel[c.Channel] <= quota {
 			continue
 		}
-		remove(c, "camera")
+		remove(c, "channel")
 	}
 
 	// Then the global line, over whatever is left.

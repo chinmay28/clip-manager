@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/chinmay28/clip-manager/internal/clips"
 )
 
 func testServer(t *testing.T, source string) *Server {
@@ -168,6 +171,91 @@ func TestChannelLabelRoundTrip(t *testing.T) {
 	s.Handler().ServeHTTP(rec, req)
 	if rec.Code != 200 {
 		t.Fatalf("label clear: want 200, got %d: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestListingServesStaleFromScanCacheThenCatchesUp(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "a.dav"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, source)
+	s.ScanCache = &clips.Cache{TTL: -1} // every hit stale: the background path, every time
+
+	get := func() (clips int, stale bool) {
+		t.Helper()
+		rec := httptest.NewRecorder()
+		s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips", nil))
+		var body struct {
+			Clips []map[string]any `json:"clips"`
+			Stale bool             `json:"stale"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return len(body.Clips), body.Stale
+	}
+
+	if n, stale := get(); n != 1 || stale {
+		t.Fatalf("the first listing walks fresh: %d clips, stale=%v", n, stale)
+	}
+	if err := os.WriteFile(filepath.Join(source, "b.dav"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The snapshot answers — one clip, marked stale — and the rescan it
+	// kicked off delivers the second clip to a later request. This is the
+	// contract the web client's re-ask loop is written against.
+	if n, stale := get(); n != 1 || !stale {
+		t.Fatalf("want the old snapshot marked stale, got %d clips, stale=%v", n, stale)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if n, _ := get(); n == 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the background rescan never reached the API")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func TestEnforceDropsTheScanCache(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "cam.dav"), []byte("xxxx"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := testServer(t, source)
+	s.ScanCache = &clips.Cache{TTL: time.Hour}
+
+	// Seed the snapshot, then delete everything via a 1-byte quota.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips", nil))
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("PUT", "/api/storage/config", strings.NewReader(`{"quota_bytes":1}`)))
+	if rec.Code != 200 {
+		t.Fatalf("config save failed: %s", rec.Body.String())
+	}
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("POST", "/api/storage/enforce", nil))
+	if rec.Code != 200 {
+		t.Fatalf("enforce failed: %s", rec.Body.String())
+	}
+
+	// However young the snapshot, the next listing must not show the
+	// deleted clip — a cleanup that leaves ghosts in the list reads as one
+	// that lied about deleting.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips", nil))
+	var body struct {
+		Clips []map[string]any `json:"clips"`
+		Stale bool             `json:"stale"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Clips) != 0 || body.Stale {
+		t.Fatalf("want an empty, fresh listing after enforcement, got %d clips, stale=%v", len(body.Clips), body.Stale)
 	}
 }
 

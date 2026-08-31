@@ -1,11 +1,13 @@
 // Package clips reads the recordings directory: which clips exist, which
 // camera each belongs to, and which of them a browser can play as-is.
 //
-// The directory is the source of truth and nothing else is kept — no index, no
-// database. Security cameras (and the NVR software behind them) write a new
-// file every few seconds and rotate old ones out; any record this package kept
-// of that directory would be stale before it was written. Every listing is a
-// fresh walk.
+// The directory is the source of truth — no index, no database. Security
+// cameras (and the NVR software behind them) write a new file every few
+// seconds and rotate old ones out; any record this package kept of that
+// directory would be stale before it was written. Every listing is a walk of
+// the directory; the only thing kept between walks is the last one's answer
+// (see Cache), served while the next walk runs so the app never waits on one
+// — a convenience over the walk, never a replacement for it.
 //
 // Layout convention: the first path element under the clips root names the
 // camera — `front-door/2026-08-30/12.00.01.dav` belongs to `front-door`. A

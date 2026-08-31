@@ -19,6 +19,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/chinmay28/clip-manager/internal/clips"
 	"github.com/chinmay28/clip-manager/internal/server"
 	"github.com/chinmay28/clip-manager/internal/storage"
 	"github.com/chinmay28/clip-manager/internal/version"
@@ -176,7 +177,12 @@ func cmdServe(args []string) {
 		PinnedSources: pinned,
 		ConfigPath:    filepath.Join(data, "config.json"),
 		FFmpeg:        ffmpeg,
+		// The scan cache is what makes opening the app instant: listings are
+		// answered from the last walk (persisted across restarts) while the
+		// next walk runs behind them.
+		ScanCache: &clips.Cache{Path: filepath.Join(data, "scancache.json.gz")},
 	}
+	go srv.WarmScanCache()
 	if *every > 0 {
 		go srv.EnforceLoop(*every)
 	}
@@ -205,7 +211,7 @@ func cmdPrune(args []string) {
 	if err != nil {
 		log.Fatal(err)
 	}
-	if cfg.QuotaBytes <= 0 && len(cfg.CameraQuotaBytes) == 0 {
+	if cfg.QuotaBytes <= 0 && len(cfg.ChannelQuotaBytes) == 0 {
 		fmt.Println("no quota configured — nothing to enforce")
 		return
 	}

@@ -10,6 +10,38 @@ tag that shouldn't be published.
 
 ## Unreleased — the 2026.8 line
 
+### The first load stopped waiting on the walk
+
+Every listing used to walk every source before answering — and one app load
+fires several listings, so opening the app meant walking the archive a few
+times over, slower with every file the cameras add. Listings are now
+answered from a **scan cache**: the last walk's answer, served immediately,
+with a fresh walk running behind it when the snapshot is older than a few
+seconds. The response says which it got (`"stale": true`), and the app
+quietly re-asks until the fresh walk lands — so the footage appears at once
+and corrects itself moments later if anything changed. The snapshot persists
+in the data directory (`scancache.json.gz`), so even a freshly restarted
+server answers its first request from the previous run's walk, and it is
+warmed at startup besides. The walk is still the only truth: quota
+enforcement never reads the cache — footage is deleted only off a fresh walk
+— and a cleanup drops the snapshot so no listing shows clips that are gone.
+
+### Quotas moved from directories to channels
+
+Per-camera quotas used to key on the first directory under a source — which,
+for recorders that bucket FTP uploads by date, made the Storage table offer a
+quota per *date* and nothing per camera. Quotas now key on the **channel** —
+the identity the clips themselves carry (`N843A8_ch3_main_…` → `N843A8_ch3`,
+camera directory as the fallback), the same thing the Clips tab groups by and
+labels rename. So "Front door keeps 10 GB, the backyard 5" works on every
+layout, and a channel's line follows its footage across date directories and
+sources alike. Channel labels name the rows in the Storage table; the quota
+stays drawn on the channel underneath, so renaming a channel never moves a
+line. Old configs are migrated on load: `camera_quota_bytes` folds into
+`channel_quota_bytes` (for one-directory-per-camera layouts the directory
+name *is* the channel, so each line lands where it always was), and
+enforcement reports now say `channel quota` where they said `camera`.
+
 ### Channels, days, hours — and a clean front page
 
 The home page is now the clips and nothing else — the *Sources* and *Storage*
