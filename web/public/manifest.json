@@ -1,0 +1,16 @@
+{
+  "id": "/",
+  "name": "Clip Manager",
+  "short_name": "Clips",
+  "description": "View the clips your security cameras record — .dav included — and keep their directory in budget with quotas that retire the oldest footage first.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#0a0e17",
+  "theme_color": "#0a0e17",
+  "icons": [
+    { "src": "/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}

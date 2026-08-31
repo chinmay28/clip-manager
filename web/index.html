@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Paints the phone's own browser chrome to match the app rather than
+         leaving a white bar above a dark page. -->
+    <meta name="theme-color" content="#0a0e17" />
+    <title>Clip Manager — camera clips, kept in budget</title>
+    <!--
+      Nothing is fetched from anywhere. The app is served entirely from the
+      local binary: linking a webfont would announce every time you check your
+      cameras to a third party. Typography is whatever the system provides;
+      the one embedded exception is the wordmark's script face, inlined as a
+      data: URI by the build (see web/vite.config.js) rather than linked.
+    -->
+    <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+
+    <!--
+      Added to a phone's home screen, the app gets its own icon and opens
+      without browser chrome, like the app it behaves as. The two platforms ask
+      for that in different dialects and neither reads the other's, so both are
+      declared here.
+
+      Android reads the manifest — named .json rather than .webmanifest so the
+      Go file server answers with a JSON content type from its built-in table
+      instead of whatever the host's mime.types happens to know.
+
+      iOS reads none of it: it takes the icon from apple-touch-icon (a raster
+      image only — it will not take the SVG above), the home-screen label from
+      apple-mobile-web-app-title, and standalone launch from the -capable flag.
+      The black status bar style is the one that keeps white text over a dark
+      app without moving content up under the clock.
+    -->
+    <link rel="manifest" href="/manifest.json" />
+    <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+    <meta name="apple-mobile-web-app-title" content="Clip Manager" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black" />
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/index.jsx"></script>
+  </body>
+</html>
