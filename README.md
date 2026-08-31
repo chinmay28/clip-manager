@@ -43,11 +43,16 @@ dedicated `clip` system user, compiles the web client and the static server
 binary, and runs it under systemd on `http://<host>:8124`, reachable from your
 network.
 
-Point it at footage your cameras already write:
+Point it at footage your cameras already write — one directory or several,
+colon-separated like `PATH`:
 
 ```bash
-curl -fsSL .../quickstart.sh | sudo CLIP_CLIPS_DIR=/mnt/nvr/footage bash
+curl -fsSL .../quickstart.sh | sudo CLIP_CLIPS_DIR=/mnt/nvr/footage:/media/usb/overflow bash
 ```
+
+Directories named this way are **pinned** — always in the source set, not
+removable from a browser. More sources can be added and removed later in the
+app itself (see [Sources](#sources)).
 
 **Or skip the build entirely** and install the prebuilt binary from the latest
 [release](https://github.com/chinmay28/clip-manager/releases) — no Node, no
@@ -107,15 +112,16 @@ away from your footage.
 # 1. Build (requires Go 1.25+ and Node.js 18+)
 make build
 
-# 2. Run it over the directory your cameras record into
-./clip serve --clips /mnt/nvr/footage --port 8124
+# 2. Run it over the directories your cameras record into — repeat --clips
+#    for several sources
+./clip serve --clips /mnt/nvr/footage --clips /media/usb/overflow --port 8124
 # → http://127.0.0.1:8124
 
 # 3. Draw quotas in the app, or try a cleanup from the shell first
-./clip prune --clips /mnt/nvr/footage --dry-run
+./clip prune --clips /mnt/nvr/footage --clips /media/usb/overflow --dry-run
 ```
 
-The clips directory is laid out the way NVRs and ffmpeg-based recorders
+Each source directory is laid out the way NVRs and ffmpeg-based recorders
 already write it — **one subdirectory per camera**, clips inside:
 
 ```
@@ -125,8 +131,34 @@ footage/
 └── backyard/…
 ```
 
-A file directly in the root belongs to no camera; it is listed, and covered by
-the directory-wide quota, but a per-camera quota has nothing to meter it by.
+A file directly in a source's root belongs to no camera; it is listed, and
+covered by the total quota, but a per-camera quota has nothing to meter it by.
+
+## Sources
+
+The clips can come from **one or more source directories** — the NVR's tree
+on the internal disk and the overflow on a USB drive, say. The set is the
+union of two lists:
+
+- **Pinned** sources, named on the command line (`--clips`, repeated) or in
+  `CLIP_CLIPS_DIR` (colon-separated). The app shows them and cannot remove
+  them — what the operator pinned at launch outranks a click in a browser.
+- Sources **added in the app** (the *Sources* panel, or `POST /api/sources`),
+  stored in `config.json`. These can be removed again the same way. The
+  directory must already exist: adding adopts footage, it never invents a
+  place for it. Removing a source deletes nothing — it takes the directory
+  out of view and out from under the quotas, and the files stay exactly where
+  they are.
+
+With nothing named anywhere, `<data>/clips` is created and used, so a fresh
+install always has somewhere to point a camera at.
+
+A source that stops being readable — an unplugged drive, a NAS that is down —
+stays listed and is reported as unreadable rather than forgotten: its clips
+drop out of the listing and **out of the quota figures** (the app says so, in
+so many words, since a total that silently halves reads as deleted footage),
+and enforcement never acts on footage it cannot see. Plug it back in and
+everything reappears.
 
 ---
 
@@ -135,13 +167,17 @@ the directory-wide quota, but a per-camera quota has nothing to meter it by.
 Two kinds of line can be drawn, both in the app (or by editing
 `config.json` in the data directory):
 
-- a **directory quota** — how much the whole clips directory may hold
-- a **per-camera quota** — how much one camera's subdirectory may hold
+- a **total quota** — how much footage all the sources together may hold
+- a **per-camera quota** — how much one camera may hold. The camera's *name*
+  is its identity: the same directory name under two sources is one camera to
+  its quota, deliberately, so a camera whose footage is split across a disk
+  and its overflow still answers to one line.
 
-When a line is crossed, enforcement deletes the **oldest footage first** until
-the directory is back under it. Camera quotas run before the global one, so a
-camera over its own line pays for itself before well-behaved cameras lose
-anything to the shared total.
+When a line is crossed, enforcement deletes the **oldest footage first,
+across every source** — the oldest goes first wherever it sits — until the
+figure is back under it. Camera quotas run before the global one, so a camera
+over its own line pays for itself before well-behaved cameras lose anything
+to the shared total.
 
 What keeps this safe to run unattended:
 
@@ -189,11 +225,14 @@ usable from a script:
 
 | Endpoint | What |
 |---|---|
-| `GET /api/health` | `{status, version, clips_dir}` — what the installer polls |
-| `GET /api/clips` | every clip: path, camera, size, mtime, playable |
-| `GET /api/clip?path=…` | one clip's bytes, with range support |
-| `GET /api/storage` | usage (total and per camera) + the current quota config |
-| `PUT /api/storage/config` | replace the quota config |
+| `GET /api/health` | `{status, version, sources}` — what the installer polls |
+| `GET /api/clips` | every clip across every source: source, path, camera, size, mtime, playable — plus which sources were unreadable |
+| `GET /api/clip?source=…&path=…` | one clip's bytes, with range support; the source must be a configured one |
+| `GET /api/sources` | the source set: path, pinned, available |
+| `POST /api/sources` | add a source `{path}` — must exist and be absolute |
+| `DELETE /api/sources?path=…` | forget a runtime-added source (files untouched; pinned ones refuse) |
+| `GET /api/storage` | usage (total, per camera, per source) + the current quota config |
+| `PUT /api/storage/config` | replace the quota config (sources are untouched — they have their own endpoints) |
 | `POST /api/storage/enforce` | run enforcement now; `?dry_run=1` to only report |
 
 ---

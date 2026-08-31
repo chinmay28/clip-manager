@@ -9,14 +9,16 @@ import { Brand, DevMark } from './components/Brand'
 export function App() {
   const [clips, setClips] = useState(null)
   const [storage, setStorage] = useState(null)
+  const [sources, setSources] = useState(null)
   const [error, setError] = useState(null)
   const [playing, setPlaying] = useState(null)
 
   const refresh = useCallback(async () => {
     try {
-      const [c, s] = await Promise.all([api.clips(), api.storage()])
+      const [c, s, src] = await Promise.all([api.clips(), api.storage(), api.sources()])
       setClips(c.clips || [])
       setStorage(s)
+      setSources(src.sources || [])
       setError(null)
     } catch (e) {
       setError(e.message)
@@ -51,8 +53,19 @@ export function App() {
           }}>{error}</div>
         )}
 
+        {sources && storage && (
+          <SourcesPanel sources={sources} usage={storage.usage} onChanged={refresh} />
+        )}
         {storage && <StoragePanel storage={storage} onChanged={refresh} />}
-        {clips && <ClipList clips={clips} onPlay={setPlaying} />}
+        {clips && (
+          <ClipList
+            clips={clips}
+            onPlay={setPlaying}
+            // Naming the source on every row only earns its ink once there
+            // is more than one place a clip could have come from.
+            showSource={(sources || []).length > 1}
+          />
+        )}
         {!clips && !error && (
           <p style={{ color: COLORS.textMuted }}>Loading…</p>
         )}
@@ -60,6 +73,132 @@ export function App() {
 
       {playing && <Player clip={playing} onClose={() => setPlaying(null)} />}
     </Shell>
+  )
+}
+
+/* ------------------------------------------------------------------------- */
+/* Sources: the directories the clips come from                              */
+/* ------------------------------------------------------------------------- */
+
+/* The last path segment is usually the name a person knows the directory by;
+   the full path stays in the row's title and beside it in the muted text. */
+const baseName = (p) => p.split('/').filter(Boolean).pop() || p
+
+function SourcesPanel({ sources, usage, onChanged }) {
+  const [path, setPath] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState(null)
+
+  const add = async () => {
+    if (!path.trim()) return
+    setBusy(true)
+    setError(null)
+    try {
+      await api.addSource(path.trim())
+      setPath('')
+      await onChanged()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const remove = async (src) => {
+    setBusy(true)
+    setError(null)
+    try {
+      await api.removeSource(src)
+      await onChanged()
+    } catch (e) {
+      setError(e.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <section style={{
+      marginBottom: '26px',
+      padding: '16px',
+      borderRadius: '10px',
+      border: `1px solid ${COLORS.border}`,
+      background: COLORS.surface,
+    }}>
+      <h2 style={{ margin: '0 0 10px', fontSize: '15px', fontWeight: 600 }}>Sources</h2>
+
+      {sources.map((s) => {
+        const su = (usage.sources || {})[s.path]
+        return (
+          <div key={s.path} title={s.path} style={{
+            display: 'flex',
+            alignItems: 'center',
+            gap: '10px',
+            padding: '7px 0',
+            borderTop: `1px solid ${COLORS.border}`,
+            fontSize: '13px',
+          }}>
+            <span style={{ minWidth: 0, flex: 1 }}>
+              <span style={{ color: COLORS.text }}>{baseName(s.path)}</span>
+              <span style={{
+                color: COLORS.textMuted,
+                marginLeft: '8px',
+                fontFamily: FONT.mono,
+                fontSize: '12px',
+                wordBreak: 'break-all',
+              }}>{s.path}</span>
+            </span>
+            {!s.available ? (
+              /* An unplugged drive or a NAS that is down: the source stays
+                 listed — forgetting it would read as deleted footage — and
+                 the row says why its clips are not in the list right now. */
+              <span style={{ color: COLORS.warn }}>not readable right now</span>
+            ) : (
+              <span style={{ color: COLORS.textDim, fontFamily: FONT.mono }}>
+                {su ? <>{formatBytes(su.bytes)}<span style={{ color: COLORS.textMuted }}> · {su.files}</span></> : '—'}
+              </span>
+            )}
+            {s.pinned ? (
+              /* Named on the service's command line: the app shows it but
+                 cannot remove it — what the operator pinned outranks a
+                 click. */
+              <span title="Named on the service's command line" style={{
+                fontFamily: FONT.mono,
+                fontSize: '11px',
+                color: COLORS.textMuted,
+                border: `1px solid ${COLORS.border}`,
+                borderRadius: '4px',
+                padding: '2px 6px',
+              }}>pinned</span>
+            ) : (
+              <button type="button" onClick={() => remove(s.path)} disabled={busy} style={buttonStyle()}>
+                Remove
+              </button>
+            )}
+          </div>
+        )
+      })}
+
+      <div style={{ display: 'flex', gap: '8px', marginTop: '10px', flexWrap: 'wrap' }}>
+        <input
+          value={path}
+          onChange={(e) => setPath(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') add() }}
+          placeholder="/path/to/footage"
+          style={{ ...inputStyle, width: 'min(340px, 100%)', textAlign: 'left' }}
+        />
+        <button type="button" onClick={add} disabled={busy || !path.trim()} style={buttonStyle(true)}>
+          Add source
+        </button>
+      </div>
+      <p style={{ color: COLORS.textMuted, fontSize: '12px', margin: '8px 0 0' }}>
+        An absolute path on the machine the server runs on, laid out one
+        subdirectory per camera. Removing a source deletes nothing — it only
+        takes the directory out of view and out from under the quotas.
+      </p>
+
+      {error && <p style={{ color: COLORS.error, fontSize: '13px', margin: '10px 0 0' }}>{error}</p>}
+    </section>
   )
 }
 
@@ -149,6 +288,14 @@ function StoragePanel({ storage, onChanged }) {
 
       {quota > 0 && (
         <UsageBar fraction={usage.bytes / quota} over={over} />
+      )}
+
+      {(usage.missing || []).length > 0 && (
+        /* A total that silently shrank because a disk went away would read
+           as deleted footage — say which sources the figures do not cover. */
+        <p style={{ color: COLORS.warn, fontSize: '13px', margin: '10px 0 0' }}>
+          Not counted — unreadable right now: {usage.missing.join(', ')}
+        </p>
       )}
 
       <div style={{
@@ -278,7 +425,7 @@ function EnforceReport({ report, onDismiss }) {
           overflowY: 'auto',
         }}>
           {report.deleted.map((d) => (
-            <li key={d.path}>{d.path} — {formatBytes(d.size)} ({d.rule} quota)</li>
+            <li key={`${d.source}:${d.path}`}>{d.path} — {formatBytes(d.size)} ({d.rule} quota)</li>
           ))}
         </ul>
       )}
@@ -293,7 +440,7 @@ function EnforceReport({ report, onDismiss }) {
 /* The clips themselves                                                      */
 /* ------------------------------------------------------------------------- */
 
-function ClipList({ clips, onPlay }) {
+function ClipList({ clips, onPlay, showSource }) {
   const [camera, setCamera] = useState(null)
 
   const cameras = useMemo(
@@ -331,7 +478,12 @@ function ClipList({ clips, onPlay }) {
 
       <div style={{ borderRadius: '10px', border: `1px solid ${COLORS.border}`, overflow: 'hidden' }}>
         {shown.map((clip) => (
-          <ClipRow key={clip.path} clip={clip} onPlay={onPlay} />
+          <ClipRow
+            key={`${clip.source}:${clip.path}`}
+            clip={clip}
+            onPlay={onPlay}
+            showSource={showSource}
+          />
         ))}
       </div>
     </section>
@@ -356,7 +508,7 @@ function Chip({ active, onClick, children }) {
   )
 }
 
-function ClipRow({ clip, onPlay }) {
+function ClipRow({ clip, onPlay, showSource }) {
   const when = new Date(clip.mod_time)
   return (
     <div style={{
@@ -377,6 +529,7 @@ function ClipRow({ clip, onPlay }) {
         }}>{clip.name}</div>
         <div style={{ color: COLORS.textMuted, fontSize: '12px' }}>
           {clip.camera && <>{clip.camera} · </>}
+          {showSource && <span title={clip.source}>{baseName(clip.source)} · </span>}
           {formatBytes(clip.size)} · {when.toLocaleString()}
         </div>
       </span>
@@ -397,7 +550,7 @@ function ClipRow({ clip, onPlay }) {
             borderRadius: '4px',
             padding: '2px 6px',
           }}>{clip.ext.replace('.', '')}</span>
-          <a href={clipURL(clip.path)} download={clip.name} style={{
+          <a href={clipURL(clip)} download={clip.name} style={{
             ...buttonStyle(),
             textDecoration: 'none',
             display: 'inline-flex',
@@ -439,7 +592,7 @@ function Player({ clip, onClose }) {
           <button type="button" onClick={onClose} style={buttonStyle()}>Close</button>
         </div>
         <video
-          src={clipURL(clip.path)}
+          src={clipURL(clip)}
           controls
           autoPlay
           style={{ width: '100%', borderRadius: '8px', background: '#000' }}

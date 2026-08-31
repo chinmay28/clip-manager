@@ -14,6 +14,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"path"
 	"path/filepath"
 	"strings"
@@ -34,13 +35,17 @@ var distFS embed.FS
 
 // Server serves the API and the embedded client.
 type Server struct {
-	// ClipsDir is the directory the cameras record into.
-	ClipsDir string
-	// ConfigPath is where the quota policy lives (JSON).
+	// PinnedSources are the clip directories named on the command line (or
+	// by the systemd unit). They are always in the source set and the API
+	// cannot remove them — what the operator pinned at launch outranks what
+	// anybody clicks in a browser.
+	PinnedSources []string
+	// ConfigPath is where the quota policy and the runtime-added sources
+	// live (JSON).
 	ConfigPath string
 
 	// mu serialises config writes and enforcement runs. Listings do not take
-	// it — they read the directory, which is safe beside a delete.
+	// it — they read the directories, which is safe beside a delete.
 	mu sync.Mutex
 }
 
@@ -50,11 +55,44 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/clips", s.handleClips)
 	mux.HandleFunc("GET /api/clip", s.handleClip)
+	mux.HandleFunc("GET /api/sources", s.handleSourcesGet)
+	mux.HandleFunc("POST /api/sources", s.handleSourceAdd)
+	mux.HandleFunc("DELETE /api/sources", s.handleSourceRemove)
 	mux.HandleFunc("GET /api/storage", s.handleStorage)
 	mux.HandleFunc("PUT /api/storage/config", s.handleConfigPut)
 	mux.HandleFunc("POST /api/storage/enforce", s.handleEnforce)
 	mux.Handle("/", s.spaHandler())
 	return mux
+}
+
+// sources is the effective source set: what the command line pinned, then
+// what the config added, deduplicated in that order. Resolved fresh on every
+// request — the config is the source of truth and may have just changed.
+func (s *Server) sources() ([]string, error) {
+	cfg, err := storage.Load(s.ConfigPath)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, src := range append(append([]string{}, s.PinnedSources...), cfg.Sources...) {
+		src = filepath.Clean(src)
+		if seen[src] {
+			continue
+		}
+		seen[src] = true
+		out = append(out, src)
+	}
+	return out, nil
+}
+
+func (s *Server) pinned(src string) bool {
+	for _, p := range s.PinnedSources {
+		if filepath.Clean(p) == src {
+			return true
+		}
+	}
+	return false
 }
 
 // EnforceLoop runs quota enforcement on a schedule, for as long as the server
@@ -86,32 +124,159 @@ func (s *Server) enforce(dryRun bool) (storage.Report, error) {
 	if err != nil {
 		return storage.Report{}, err
 	}
-	return storage.Enforce(s.ClipsDir, cfg, dryRun)
+	srcs, err := s.sources()
+	if err != nil {
+		return storage.Report{}, err
+	}
+	return storage.Enforce(srcs, cfg, dryRun)
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	srcs, _ := s.sources()
 	writeJSON(w, map[string]any{
-		"status":    "ok",
-		"version":   version.String(),
-		"clips_dir": s.ClipsDir,
+		"status":  "ok",
+		"version": version.String(),
+		"sources": srcs,
 	})
 }
 
 func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
-	list, err := clips.Scan(s.ClipsDir)
+	srcs, err := s.sources()
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "listing clips: %v", err)
+		httpError(w, http.StatusInternalServerError, "reading sources: %v", err)
 		return
 	}
-	writeJSON(w, map[string]any{"clips": list})
+	list, missing := clips.ScanAll(srcs)
+	writeJSON(w, map[string]any{"clips": list, "missing_sources": missing})
+}
+
+// handleSourcesGet lists the effective source set: path, whether the command
+// line pinned it, and whether it is readable right now. Cheap on purpose — no
+// walk; the usage figures live on /api/storage.
+func (s *Server) handleSourcesGet(w http.ResponseWriter, r *http.Request) {
+	srcs, err := s.sources()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading sources: %v", err)
+		return
+	}
+	type row struct {
+		Path      string `json:"path"`
+		Pinned    bool   `json:"pinned"`
+		Available bool   `json:"available"`
+	}
+	rows := []row{}
+	for _, src := range srcs {
+		info, statErr := os.Stat(src)
+		rows = append(rows, row{
+			Path:      src,
+			Pinned:    s.pinned(src),
+			Available: statErr == nil && info.IsDir(),
+		})
+	}
+	writeJSON(w, map[string]any{"sources": rows})
+}
+
+// handleSourceAdd puts one more directory under management. The path has to
+// exist and be a directory already: this adopts footage, it does not invent
+// places for it, and creating a mistyped path would report "no clips" instead
+// of the mistake. Adding a source also puts its footage under the quotas, so
+// the bar for accepting a path is "it is really there".
+func (s *Server) handleSourceAdd(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Path string `json:"path"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		httpError(w, http.StatusBadRequest, "bad request: %v", err)
+		return
+	}
+	src := filepath.Clean(strings.TrimSpace(body.Path))
+	if !filepath.IsAbs(src) {
+		httpError(w, http.StatusBadRequest, "path must be absolute (got %q)", body.Path)
+		return
+	}
+	info, err := os.Stat(src)
+	if err != nil {
+		httpError(w, http.StatusBadRequest, "%s does not exist — point at the directory the cameras record into", src)
+		return
+	}
+	if !info.IsDir() {
+		httpError(w, http.StatusBadRequest, "%s is not a directory", src)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := storage.Load(s.ConfigPath)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
+		return
+	}
+	if s.pinned(src) || sliceHas(cfg.Sources, src) {
+		httpError(w, http.StatusConflict, "%s is already a source", src)
+		return
+	}
+	cfg.Sources = append(cfg.Sources, src)
+	if err := storage.Save(s.ConfigPath, cfg); err != nil {
+		httpError(w, http.StatusInternalServerError, "saving config: %v", err)
+		return
+	}
+	writeJSON(w, map[string]any{"added": src})
+}
+
+// handleSourceRemove forgets a runtime-added source. The directory and every
+// clip in it are left exactly as they are — removal takes the footage out of
+// the app's view and out from under the quotas, it deletes nothing. Pinned
+// sources are refused: the command line put them there and only the command
+// line takes them away.
+func (s *Server) handleSourceRemove(w http.ResponseWriter, r *http.Request) {
+	src := filepath.Clean(strings.TrimSpace(r.URL.Query().Get("path")))
+	if s.pinned(src) {
+		httpError(w, http.StatusBadRequest, "%s is pinned by the command line — remove it from the service's flags instead", src)
+		return
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cfg, err := storage.Load(s.ConfigPath)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
+		return
+	}
+	if !sliceHas(cfg.Sources, src) {
+		httpError(w, http.StatusNotFound, "%s is not a source", src)
+		return
+	}
+	kept := cfg.Sources[:0]
+	for _, existing := range cfg.Sources {
+		if existing != src {
+			kept = append(kept, existing)
+		}
+	}
+	cfg.Sources = kept
+	if err := storage.Save(s.ConfigPath, cfg); err != nil {
+		httpError(w, http.StatusInternalServerError, "saving config: %v", err)
+		return
+	}
+	writeJSON(w, map[string]any{"removed": src})
+}
+
+func sliceHas(list []string, v string) bool {
+	for _, s := range list {
+		if s == v {
+			return true
+		}
+	}
+	return false
 }
 
 // handleClip serves one recording's bytes, with range support — that is what
-// lets a browser scrub a playable clip rather than downloading it whole.
+// lets a browser scrub a playable clip rather than downloading it whole. The
+// clip is addressed the way the listing handed it out: which source, and the
+// path relative to it.
 func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
-	full, ok := s.resolve(r.URL.Query().Get("path"))
+	full, ok := s.resolve(r.URL.Query().Get("source"), r.URL.Query().Get("path"))
 	if !ok {
-		httpError(w, http.StatusBadRequest, "bad path")
+		httpError(w, http.StatusBadRequest, "bad source or path")
 		return
 	}
 	// .dav has no registered MIME type; without this the Go file server
@@ -123,27 +288,37 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, full)
 }
 
-// resolve turns an API-supplied relative path into an absolute one inside the
-// clips directory, refusing anything that would escape it. The API hands out
-// these paths itself (clips.Scan), but the check does not rely on that: any
-// string arriving over HTTP gets the same treatment.
-func (s *Server) resolve(rel string) (string, bool) {
-	if rel == "" {
+// resolve turns an API-supplied (source, relative path) pair into an absolute
+// path, refusing a source that is not in the configured set and a path that
+// would escape it. The API hands out both halves itself (clips.ScanAll), but
+// the check does not rely on that: any string arriving over HTTP gets the
+// same treatment — the source must match a configured root exactly, so the
+// endpoint can serve nothing the source list does not already admit to.
+func (s *Server) resolve(source, rel string) (string, bool) {
+	if source == "" || rel == "" {
+		return "", false
+	}
+	srcs, err := s.sources()
+	if err != nil {
+		return "", false
+	}
+	source = filepath.Clean(source)
+	if !sliceHas(srcs, source) {
 		return "", false
 	}
 	// Clean with a leading slash so ".." cannot climb, then re-relativise.
 	cleaned := path.Clean("/" + filepath.ToSlash(rel))
-	full := filepath.Join(s.ClipsDir, filepath.FromSlash(strings.TrimPrefix(cleaned, "/")))
-	if rp, err := filepath.Rel(s.ClipsDir, full); err != nil || strings.HasPrefix(rp, "..") {
+	full := filepath.Join(source, filepath.FromSlash(strings.TrimPrefix(cleaned, "/")))
+	if rp, err := filepath.Rel(source, full); err != nil || strings.HasPrefix(rp, "..") {
 		return "", false
 	}
 	return full, true
 }
 
 func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
-	usage, err := storage.Measure(s.ClipsDir)
+	srcs, err := s.sources()
 	if err != nil {
-		httpError(w, http.StatusInternalServerError, "measuring: %v", err)
+		httpError(w, http.StatusInternalServerError, "reading sources: %v", err)
 		return
 	}
 	cfg, err := storage.Load(s.ConfigPath)
@@ -151,7 +326,7 @@ func (s *Server) handleStorage(w http.ResponseWriter, r *http.Request) {
 		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
 		return
 	}
-	writeJSON(w, map[string]any{"usage": usage, "config": cfg})
+	writeJSON(w, map[string]any{"usage": storage.Measure(srcs), "config": cfg})
 }
 
 func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
@@ -171,9 +346,17 @@ func (s *Server) handleConfigPut(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.mu.Lock()
-	err := storage.Save(s.ConfigPath, cfg)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	// This endpoint edits the quotas and nothing else. Sources have their
+	// own endpoints — a quota save must not silently drop a source somebody
+	// added between this client's load and its save.
+	current, err := storage.Load(s.ConfigPath)
 	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
+		return
+	}
+	cfg.Sources = current.Sources
+	if err := storage.Save(s.ConfigPath, cfg); err != nil {
 		httpError(w, http.StatusInternalServerError, "saving config: %v", err)
 		return
 	}

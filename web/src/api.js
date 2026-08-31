@@ -14,6 +14,15 @@ async function request(path, options) {
 export const api = {
   health: () => request('/api/health'),
   clips: () => request('/api/clips'),
+  sources: () => request('/api/sources'),
+  addSource: (path) => request('/api/sources', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ path }),
+  }),
+  removeSource: (path) => request(`/api/sources?path=${encodeURIComponent(path)}`, {
+    method: 'DELETE',
+  }),
   storage: () => request('/api/storage'),
   saveConfig: (config) => request('/api/storage/config', {
     method: 'PUT',
@@ -26,5 +35,7 @@ export const api = {
 }
 
 /* Where a clip's bytes are served from — the <video> src and the download
-   href alike. */
-export const clipURL = (path) => `/api/clip?path=${encodeURIComponent(path)}`
+   href alike. A clip is addressed the way the listing handed it out: which
+   source, and the path relative to it. */
+export const clipURL = (clip) =>
+  `/api/clip?source=${encodeURIComponent(clip.source)}&path=${encodeURIComponent(clip.path)}`

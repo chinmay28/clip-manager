@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/chinmay28/clip-manager/internal/server"
@@ -53,8 +54,11 @@ Usage:
   clip version          print the version
 
 Flags for serve:
-  --clips DIR           the directory the cameras record into
-                        (default $CLIP_CLIPS_DIR, else <data>/clips)
+  --clips DIR           a directory the cameras record into. Repeat the flag
+                        for several sources (or set $CLIP_CLIPS_DIR to a
+                        colon-separated list). More can be added and removed
+                        in the app; the ones given here are pinned. With none
+                        given anywhere, <data>/clips is used.
   --data DIR            where the quota config lives
                         (default $CLIP_DATA_DIR, else ~/.clip)
   --port N              listen port (default 8124)
@@ -83,47 +87,94 @@ func dataDir(flagValue string) string {
 	return filepath.Join(home, ".clip")
 }
 
-func clipsDir(flagValue, data string) string {
-	if flagValue != "" {
-		return flagValue
+// multiFlag collects a repeatable string flag: --clips /a --clips /b.
+type multiFlag []string
+
+func (m *multiFlag) String() string     { return strings.Join(*m, ":") }
+func (m *multiFlag) Set(v string) error { *m = append(*m, v); return nil }
+
+// pinnedSources resolves the source directories fixed for this run: the
+// --clips flags when any were given, else $CLIP_CLIPS_DIR split on ':' (the
+// PATH convention — one variable, several directories). Empty means the
+// command line pinned nothing, which is a real answer: sources may still come
+// from the config, and only when THAT is empty too does the caller fall back
+// to <data>/clips.
+func pinnedSources(flags multiFlag) []string {
+	if len(flags) > 0 {
+		return flags
 	}
-	if env := os.Getenv("CLIP_CLIPS_DIR"); env != "" {
-		return env
+	var out []string
+	for _, p := range strings.Split(os.Getenv("CLIP_CLIPS_DIR"), ":") {
+		if p = strings.TrimSpace(p); p != "" {
+			out = append(out, p)
+		}
 	}
-	return filepath.Join(data, "clips")
+	return out
+}
+
+// resolveSources settles the pinned source set and the data directory for one
+// run, creating the built-in default only when NOTHING else names a source —
+// the fresh-install case, where the cameras have not written anything yet and
+// a server that refused to start until they did would be impossible to set up
+// through. Explicitly named directories are the opposite case: they are
+// expected to hold footage already, and a missing one is warned about rather
+// than invented, because an empty stand-in would report "no clips" instead of
+// the typo.
+func resolveSources(flags multiFlag, dataFlag string) (pinned []string, data string) {
+	data = dataDir(dataFlag)
+	if err := os.MkdirAll(data, 0o755); err != nil {
+		log.Fatalf("data directory %s: %v", data, err)
+	}
+
+	pinned = pinnedSources(flags)
+	if len(pinned) == 0 {
+		cfg, err := storage.Load(filepath.Join(data, "config.json"))
+		if err != nil {
+			log.Fatal(err)
+		}
+		if len(cfg.Sources) > 0 {
+			return nil, data // the config carries the sources; nothing pinned
+		}
+		fallback := filepath.Join(data, "clips")
+		if err := os.MkdirAll(fallback, 0o755); err != nil {
+			log.Fatalf("clips directory %s: %v", fallback, err)
+		}
+		return []string{fallback}, data
+	}
+	for _, src := range pinned {
+		if info, err := os.Stat(src); err != nil || !info.IsDir() {
+			log.Printf("warning: source %s is not a readable directory right now — serving without its clips until it appears", src)
+		}
+	}
+	return pinned, data
 }
 
 func cmdServe(args []string) {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
-	clipsFlag := fs.String("clips", "", "directory the cameras record into")
+	var clipsFlags multiFlag
+	fs.Var(&clipsFlags, "clips", "a directory the cameras record into (repeatable)")
 	dataFlag := fs.String("data", "", "directory the quota config lives in")
 	port := fs.Int("port", 8124, "listen port")
 	bind := fs.String("bind", "0.0.0.0", "bind address")
 	every := fs.Duration("enforce-every", time.Hour, "how often quotas are enforced (0 disables)")
 	fs.Parse(args)
 
-	data := dataDir(*dataFlag)
-	clips := clipsDir(*clipsFlag, data)
-	// The clips directory is created rather than required: on a fresh
-	// install the cameras have not written anything yet, and a server that
-	// refuses to start until they do would be impossible to set up through.
-	if err := os.MkdirAll(clips, 0o755); err != nil {
-		log.Fatalf("clips directory %s: %v", clips, err)
-	}
-	if err := os.MkdirAll(data, 0o755); err != nil {
-		log.Fatalf("data directory %s: %v", data, err)
-	}
+	pinned, data := resolveSources(clipsFlags, *dataFlag)
 
 	srv := &server.Server{
-		ClipsDir:   clips,
-		ConfigPath: filepath.Join(data, "config.json"),
+		PinnedSources: pinned,
+		ConfigPath:    filepath.Join(data, "config.json"),
 	}
 	if *every > 0 {
 		go srv.EnforceLoop(*every)
 	}
 
 	addr := fmt.Sprintf("%s:%d", *bind, *port)
-	log.Printf("Clip Manager %s — serving %s on http://%s", version.String(), clips, addr)
+	described := strings.Join(pinned, ", ")
+	if described == "" {
+		described = "the sources in " + srv.ConfigPath
+	}
+	log.Printf("Clip Manager %s — serving %s on http://%s", version.String(), described, addr)
 	if err := http.ListenAndServe(addr, srv.Handler()); err != nil {
 		log.Fatal(err)
 	}
@@ -131,13 +182,13 @@ func cmdServe(args []string) {
 
 func cmdPrune(args []string) {
 	fs := flag.NewFlagSet("prune", flag.ExitOnError)
-	clipsFlag := fs.String("clips", "", "directory the cameras record into")
+	var clipsFlags multiFlag
+	fs.Var(&clipsFlags, "clips", "a directory the cameras record into (repeatable)")
 	dataFlag := fs.String("data", "", "directory the quota config lives in")
 	dryRun := fs.Bool("dry-run", false, "report what would be deleted, delete nothing")
 	fs.Parse(args)
 
-	data := dataDir(*dataFlag)
-	clips := clipsDir(*clipsFlag, data)
+	pinned, data := resolveSources(clipsFlags, *dataFlag)
 	cfg, err := storage.Load(filepath.Join(data, "config.json"))
 	if err != nil {
 		log.Fatal(err)
@@ -146,7 +197,20 @@ func cmdPrune(args []string) {
 		fmt.Println("no quota configured — nothing to enforce")
 		return
 	}
-	report, err := storage.Enforce(clips, cfg, *dryRun)
+	// The shell sees the same source set the server would: pinned plus
+	// whatever the app added to the config, deduplicated — the same
+	// directory named twice would be scanned twice and its footage counted
+	// double against the quota.
+	seen := map[string]bool{}
+	var sources []string
+	for _, src := range append(append([]string{}, pinned...), cfg.Sources...) {
+		src = filepath.Clean(src)
+		if !seen[src] {
+			seen[src] = true
+			sources = append(sources, src)
+		}
+	}
+	report, err := storage.Enforce(sources, cfg, *dryRun)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -155,7 +219,7 @@ func cmdPrune(args []string) {
 		verb = "would delete"
 	}
 	for _, d := range report.Deleted {
-		fmt.Printf("%s  %s (%s, %s quota)\n", verb, d.Path, formatBytes(d.Size), d.Rule)
+		fmt.Printf("%s  %s (%s, %s quota)\n", verb, filepath.Join(d.Source, d.Path), formatBytes(d.Size), d.Rule)
 	}
 	for _, f := range report.Failed {
 		fmt.Printf("could not remove %s\n", f)

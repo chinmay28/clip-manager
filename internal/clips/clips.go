@@ -56,8 +56,11 @@ var playable = map[string]bool{
 
 // A Clip is one recording on disk.
 type Clip struct {
-	// Path is relative to the clips root, forward-slashed — it is what the
-	// API takes back to serve or delete the file.
+	// Source is the source directory the clip lives under — one of the
+	// configured roots, verbatim. Together with Path it is the clip's
+	// identity: the API takes the pair back to serve or delete the file.
+	Source string `json:"source"`
+	// Path is relative to the clip's source, forward-slashed.
 	Path     string    `json:"path"`
 	Name     string    `json:"name"`
 	Camera   string    `json:"camera"`
@@ -67,9 +70,37 @@ type Clip struct {
 	Playable bool      `json:"playable"`
 }
 
-// Scan walks the clips root and returns every clip under it, oldest first.
-// Oldest-first is not cosmetic: it is the order quota enforcement consumes the
-// list in, and the invariant it relies on.
+// ScanAll walks every source and returns the union of their clips, oldest
+// first, each tagged with the source it came from. Oldest-first is not
+// cosmetic: it is the order quota enforcement consumes the list in, and the
+// invariant it relies on — across sources, so the oldest footage goes first
+// wherever it sits.
+//
+// A source that cannot be read at all — an unplugged drive, a NAS that is
+// down — contributes nothing rather than failing the union: the clips on the
+// sources that ARE answering must stay visible, and quota enforcement on them
+// must keep working. Which sources were unreadable is the second return; the
+// server reports it rather than guessing.
+func ScanAll(sources []string) ([]Clip, []string) {
+	var out []Clip
+	var missing []string
+	for _, root := range sources {
+		list, err := Scan(root)
+		if err != nil {
+			missing = append(missing, root)
+			continue
+		}
+		for i := range list {
+			list[i].Source = root
+		}
+		out = append(out, list...)
+	}
+	sortClips(out)
+	return out, missing
+}
+
+// Scan walks one clips root and returns every clip under it, oldest first,
+// with Source left empty — ScanAll is what tags it.
 //
 // Hidden files and directories (dot-prefixed) are skipped — sync tools and
 // NVRs leave state files around, and none of it is footage. An unreadable
@@ -124,11 +155,18 @@ func Scan(root string) ([]Clip, error) {
 	if err != nil {
 		return nil, err
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if !out[i].ModTime.Equal(out[j].ModTime) {
-			return out[i].ModTime.Before(out[j].ModTime)
-		}
-		return out[i].Path < out[j].Path // a stable order when timestamps tie
-	})
+	sortClips(out)
 	return out, nil
+}
+
+func sortClips(list []Clip) {
+	sort.Slice(list, func(i, j int) bool {
+		if !list[i].ModTime.Equal(list[j].ModTime) {
+			return list[i].ModTime.Before(list[j].ModTime)
+		}
+		if list[i].Source != list[j].Source {
+			return list[i].Source < list[j].Source
+		}
+		return list[i].Path < list[j].Path // a stable order when timestamps tie
+	})
 }

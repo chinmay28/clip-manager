@@ -63,10 +63,16 @@
 #   CLIP_DATA_DIR    config + backups dir    (default: /var/lib/clip)
 #   CLIP_CLIPS_DIR   where the cameras record (default: $CLIP_DATA_DIR/clips).
 #                    Point this at the directory your NVR or cameras already
-#                    write into — one subdirectory per camera. The service gets
-#                    write access to it, because deleting old footage against a
-#                    quota is the job; everything else on the filesystem stays
-#                    read-only to it.
+#                    write into — one subdirectory per camera — or at SEVERAL,
+#                    colon-separated (the PATH convention):
+#
+#                      CLIP_CLIPS_DIR=/mnt/nvr/footage:/media/usb/overflow
+#
+#                    Each becomes a pinned source the app cannot remove; more
+#                    can be added and removed in the app itself. The service
+#                    gets write access to every source, because deleting old
+#                    footage against a quota is the job; everything else on
+#                    the filesystem stays read-only to it.
 #   CLIP_MOUNT_ROOTS mount roots the clips directory may live under,
 #                    colon-separated (default: /media:/run/media:/mnt:/srv).
 #                    The unit is sandboxed (ProtectSystem=strict) and grants
@@ -152,12 +158,27 @@ prior_flag() {
   printf '%s' "$PRIOR_EXEC" | sed -n "s/.*--$1[= ]\([^ ]*\).*/\1/p" | head -n 1
 }
 
+# Every value of --clips in the running unit, colon-joined — the flag repeats,
+# one occurrence per source, so a single-match sed would silently drop all but
+# the first source on an upgrade.
+prior_clips() {
+  local prev="" out="" w
+  for w in $PRIOR_EXEC; do
+    case "$w" in
+      --clips=*) out="$out:${w#--clips=}" ;;
+      *) [ "$prev" = "--clips" ] && out="$out:$w" ;;
+    esac
+    prev="$w"
+  done
+  printf '%s' "${out#:}"
+}
+
 PORT="${PORT:-$(prior_flag port)}"
 PORT="${PORT:-8124}"
 HOST="${HOST:-$(prior_flag bind)}"
 HOST="${HOST:-0.0.0.0}"
-CLIPS_DIR="${CLIP_CLIPS_DIR:-$(prior_flag clips)}"
-CLIPS_DIR="${CLIPS_DIR:-$DATA_DIR/clips}"
+CLIPS_DIRS="${CLIP_CLIPS_DIR:-$(prior_clips)}"
+CLIPS_DIRS="${CLIPS_DIRS:-$DATA_DIR/clips}"
 
 INSTALL_NODE="${INSTALL_NODE:-auto}"
 INSTALL_GO="${INSTALL_GO:-auto}"
@@ -229,7 +250,7 @@ else
   fi
 fi
 printf '  %-10s %s\n' "data"     "$DATA_DIR"
-printf '  %-10s %s\n' "clips"    "$CLIPS_DIR"
+printf '  %-10s %s\n' "clips"    "$(printf '%s' "$CLIPS_DIRS" | sed 's/:/, /g')"
 printf '  %-10s %s\n' "service"  "${SERVICE_NAME}.service (user: $SVC_USER)"
 printf '  %-10s %s\n' "listen"   "http://$HOST:$PORT"
 
@@ -524,15 +545,18 @@ fi
 # ---------------------------------------------------------------------------
 step "[5/7] Data directory + backup"
 install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$DATA_DIR" "$BACKUP_DIR"
-# The clips directory is created only when it is the default under $DATA_DIR.
-# A CLIP_CLIPS_DIR you pointed at existing footage is expected to be there
-# already — inventing it would paper over a typo'd path with an empty
-# directory, and the app would then report "no clips" instead of the mistake.
-if [ "$CLIPS_DIR" = "$DATA_DIR/clips" ]; then
-  install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$CLIPS_DIR"
-elif [ ! -d "$CLIPS_DIR" ]; then
-  die "CLIP_CLIPS_DIR=$CLIPS_DIR does not exist. Point it at the directory your cameras record into, or leave it unset for $DATA_DIR/clips."
-fi
+# A clips directory is created only when it is the default under $DATA_DIR.
+# Sources you pointed at existing footage are expected to be there already —
+# inventing one would paper over a typo'd path with an empty directory, and
+# the app would then report "no clips" instead of the mistake.
+printf '%s:' "$CLIPS_DIRS" | tr ':' '\n' | while IFS= read -r src; do
+  [ -n "$src" ] || continue
+  if [ "$src" = "$DATA_DIR/clips" ]; then
+    install -d -o "$SVC_USER" -g "$SVC_USER" -m 750 "$src"
+  elif [ ! -d "$src" ]; then
+    die "clips source $src does not exist. Point CLIP_CLIPS_DIR at the directories your cameras record into (colon-separated), or leave it unset for $DATA_DIR/clips."
+  fi
+done
 ok "data dir ready ($DATA_DIR, owned by $SVC_USER)"
 
 stop_service()  { systemctl stop  "${SERVICE_NAME}.service" 2>/dev/null || true; }
@@ -594,6 +618,27 @@ mount_root_lines() {
 }
 MOUNT_ROOT_LINES="$(mount_root_lines)"
 
+# One --clips per source on the command line, and a write grant per source —
+# the '-' on the grant lets the service start with a source's drive unplugged,
+# which is exactly when its footage should merely be missing, not the whole
+# app down. Sources added later IN the app get no grant of their own and rely
+# on the mount roots above (or on living under $DATA_DIR); a source outside
+# both connects read-only and enforcement says so rather than deleting.
+CLIPS_ARGS=""
+clips_grant_lines() {
+  printf '%s:' "$CLIPS_DIRS" | tr ':' '\n' | while IFS= read -r src; do
+    [ -n "$src" ] || continue
+    printf 'ReadWritePaths=-"%s"\n' "${src%/}"
+  done
+}
+CLIPS_GRANT_LINES="$(clips_grant_lines)"
+while IFS= read -r src; do
+  [ -n "$src" ] || continue
+  CLIPS_ARGS="$CLIPS_ARGS --clips $src"
+done <<CLIPSEOF
+$(printf '%s:' "$CLIPS_DIRS" | tr ':' '\n')
+CLIPSEOF
+
 write_unit() {
   cat > "$UNIT_PATH" <<UNIT
 [Unit]
@@ -607,7 +652,7 @@ Type=simple
 User=$SVC_USER
 Group=$SVC_USER
 WorkingDirectory=$WORK_DIR
-ExecStart=$SERVER_BIN serve --port $PORT --bind $HOST --clips $CLIPS_DIR --data $DATA_DIR
+ExecStart=$SERVER_BIN serve --port $PORT --bind $HOST$CLIPS_ARGS --data $DATA_DIR
 Restart=on-failure
 RestartSec=3
 
@@ -634,7 +679,7 @@ ProtectKernelTunables=true
 ProtectControlGroups=true
 RestrictSUIDSGID=true
 ReadWritePaths=$DATA_DIR
-ReadWritePaths=-"$CLIPS_DIR"
+$CLIPS_GRANT_LINES
 $MOUNT_ROOT_LINES
 
 [Install]
@@ -730,18 +775,19 @@ cat <<DONE
 ${C_GREEN}Clip Manager $verb and running.${C_OFF}
 
   $reach_line
-  Clips:       $CLIPS_DIR   (one subdirectory per camera)
+  Clips:       $(printf '%s' "$CLIPS_DIRS" | sed 's/:/, /g')   (one subdirectory per camera)
   Config:      $CONFIG_PATH
   Backups:     $BACKUP_DIR
   Binary:      $SERVER_BIN (static; embeds the web client)
   $origin_line
   $upgrade_line
 
-  Point your cameras (or their NVR) at the clips directory, or re-run with
-  CLIP_CLIPS_DIR=/path/to/footage to adopt a directory they already write to.
-  Then draw quotas in the app — old footage is retired oldest-first to stay
-  under them. Preview any cleanup with:
-    $SERVER_BIN prune --clips $CLIPS_DIR --data $DATA_DIR --dry-run
+  Point your cameras (or their NVR) at a clips directory, or re-run with
+  CLIP_CLIPS_DIR=/path/one:/path/two to adopt directories they already write
+  to — more sources can also be added and removed in the app itself. Then
+  draw quotas — old footage is retired oldest-first, across every source, to
+  stay under them. Preview any cleanup with:
+    $SERVER_BIN prune$CLIPS_ARGS --data $DATA_DIR --dry-run
 
   Manage the service:
     systemctl status  ${SERVICE_NAME}

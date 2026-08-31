@@ -35,7 +35,7 @@ func TestEnforceDeletesOldestFirstUnderGlobalQuota(t *testing.T) {
 	writeClip(t, root, "cam1/mid.dav", 100, 20)
 	writeClip(t, root, "cam2/new.dav", 100, 10)
 
-	report, err := Enforce(root, Config{QuotaBytes: 250}, false)
+	report, err := Enforce([]string{root}, Config{QuotaBytes: 250}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,7 +54,7 @@ func TestEnforceCameraQuotaSparesOtherCameras(t *testing.T) {
 	writeClip(t, root, "quiet/old.dav", 100, 50) // oldest of all, but under its own line
 
 	cfg := Config{CameraQuotaBytes: map[string]int64{"noisy": 100}}
-	report, err := Enforce(root, cfg, false)
+	report, err := Enforce([]string{root}, cfg, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -71,7 +71,7 @@ func TestEnforceDryRunTouchesNothing(t *testing.T) {
 	writeClip(t, root, "cam/a.dav", 100, 20)
 	writeClip(t, root, "cam/b.dav", 100, 10)
 
-	report, err := Enforce(root, Config{QuotaBytes: 100}, true)
+	report, err := Enforce([]string{root}, Config{QuotaBytes: 100}, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +90,7 @@ func TestEnforceNeverTouchesForeignFiles(t *testing.T) {
 	// far over the line the directory is.
 	writeClip(t, root, "cam/notes.txt", 10_000, 90)
 
-	report, err := Enforce(root, Config{QuotaBytes: 50}, false)
+	report, err := Enforce([]string{root}, Config{QuotaBytes: 50}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -106,12 +106,80 @@ func TestEnforceNoQuotaIsANoOp(t *testing.T) {
 	root := t.TempDir()
 	writeClip(t, root, "cam/a.dav", 1000, 10)
 
-	report, err := Enforce(root, Config{}, false)
+	report, err := Enforce([]string{root}, Config{}, false)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(report.Deleted) != 0 || !exists(root, "cam/a.dav") {
 		t.Fatal("enforcement acted with no quota configured")
+	}
+}
+
+func TestEnforceGlobalQuotaSpansSources(t *testing.T) {
+	a, b := t.TempDir(), t.TempDir()
+	writeClip(t, a, "cam/oldest.dav", 100, 30) // oldest of all — first to go
+	writeClip(t, b, "cam/mid.dav", 100, 20)
+	writeClip(t, a, "cam/new.dav", 100, 10)
+
+	report, err := Enforce([]string{a, b}, Config{QuotaBytes: 250}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Deleted) != 1 || report.Deleted[0].Source != a || report.Deleted[0].Path != "cam/oldest.dav" {
+		t.Fatalf("want the oldest clip across sources deleted, got %+v", report.Deleted)
+	}
+	if exists(a, "cam/oldest.dav") || !exists(b, "cam/mid.dav") || !exists(a, "cam/new.dav") {
+		t.Fatal("wrong files removed from disk")
+	}
+}
+
+func TestEnforceCameraQuotaMergesAcrossSources(t *testing.T) {
+	// The same camera name under two sources is one camera to its quota:
+	// the oldest of its footage goes first, whichever source holds it.
+	a, b := t.TempDir(), t.TempDir()
+	writeClip(t, a, "front/old.dav", 100, 40)
+	writeClip(t, b, "front/new.dav", 100, 10)
+
+	cfg := Config{CameraQuotaBytes: map[string]int64{"front": 100}}
+	report, err := Enforce([]string{a, b}, cfg, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Deleted) != 1 || report.Deleted[0].Source != a || report.Deleted[0].Path != "front/old.dav" {
+		t.Fatalf("want front/old.dav from the first source, got %+v", report.Deleted)
+	}
+	if !exists(b, "front/new.dav") {
+		t.Fatal("the newer half of the camera's footage should survive")
+	}
+}
+
+func TestEnforceIgnoresMissingSource(t *testing.T) {
+	// An unplugged source contributes nothing to the totals: its absence
+	// must not push the figure over quota and cost a healthy source's
+	// footage.
+	a := t.TempDir()
+	writeClip(t, a, "cam/only.dav", 100, 10)
+
+	report, err := Enforce([]string{a, filepath.Join(a, "no-such-dir")}, Config{QuotaBytes: 150}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(report.Deleted) != 0 || !exists(a, "cam/only.dav") {
+		t.Fatalf("a missing source caused a deletion: %+v", report.Deleted)
+	}
+}
+
+func TestMeasureReportsMissingSources(t *testing.T) {
+	a := t.TempDir()
+	writeClip(t, a, "cam/a.dav", 100, 10)
+	gone := filepath.Join(a, "unplugged")
+
+	u := Measure([]string{a, gone})
+	if u.Bytes != 100 || len(u.Missing) != 1 || u.Missing[0] != gone {
+		t.Fatalf("want 100 bytes and %s missing, got %+v", gone, u)
+	}
+	if _, ok := u.Sources[a]; !ok {
+		t.Fatal("the readable source should have a usage row")
 	}
 }
 

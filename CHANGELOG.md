@@ -10,6 +10,21 @@ tag that shouldn't be published.
 
 ## Unreleased — the 2026.8 line
 
+### One or more source directories
+
+Clips can now come from **several source directories** at once — the NVR's
+tree on the internal disk and the overflow on a USB drive, say. Sources named
+on the command line (`--clips`, repeatable, or colon-separated
+`CLIP_CLIPS_DIR`) are pinned; more can be added and removed in the app's new
+*Sources* panel, which adopts existing directories and never creates or
+deletes anything — removing a source only takes it out of view. Quotas span
+the union: the total is measured across every source, enforcement retires the
+oldest footage first wherever it sits, and a camera's name is its identity,
+so the same camera split across two sources answers to one line. A source
+that stops being readable (an unplugged drive) stays listed, is reported
+rather than forgotten, drops out of the figures out loud, and is never
+enforced against.
+
 ### The first cut
 
 Clip Manager exists: a single static Go binary with an embedded web client
