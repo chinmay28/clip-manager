@@ -44,14 +44,25 @@ var Extensions = map[string]bool{
 }
 
 // playable is the subset a browser's <video> element can be handed directly.
-// The others (.dav above all) need remuxing before a browser will touch them;
-// until the app grows that, the UI offers them as downloads instead of
-// pretending they will play.
+// The others (.dav above all) go through the remux path instead — see
+// RemuxCandidate.
 var playable = map[string]bool{
 	".mp4":  true,
 	".m4v":  true,
 	".mov":  true,
 	".webm": true,
+}
+
+// RemuxCandidate reports whether a clip of this extension is worth handing to
+// ffmpeg for on-the-fly repackaging into fragmented MP4: every recognised
+// format a browser will not take directly. It is a candidacy, not a promise —
+// repackaging changes the container and never the codec, so a stream the
+// browser cannot decode (MJPEG in an old .avi, H.265 where the browser lacks
+// it) still fails, in the player, with the download as the fallback. Whether
+// candidacy becomes a Play button also depends on ffmpeg being on the
+// machine, which is the server's knowledge, not this package's.
+func RemuxCandidate(ext string) bool {
+	return Extensions[ext] && !playable[ext]
 }
 
 // A Clip is one recording on disk.
@@ -68,6 +79,10 @@ type Clip struct {
 	Size     int64     `json:"size"`
 	ModTime  time.Time `json:"mod_time"`
 	Playable bool      `json:"playable"`
+	// Remuxable is filled in by the server, not the scan: it means "this
+	// machine's ffmpeg can repackage this for the browser", and only the
+	// server knows whether there is an ffmpeg.
+	Remuxable bool `json:"remuxable"`
 }
 
 // ScanAll walks every source and returns the union of their clips, oldest

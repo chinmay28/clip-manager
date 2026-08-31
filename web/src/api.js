@@ -39,3 +39,8 @@ export const api = {
    source, and the path relative to it. */
 export const clipURL = (clip) =>
   `/api/clip?source=${encodeURIComponent(clip.source)}&path=${encodeURIComponent(clip.path)}`
+
+/* The remux stream for formats a browser will not take directly (.dav above
+   all): the server repackages the recording through ffmpeg on the fly. */
+export const playURL = (clip) =>
+  `/api/clip/play?source=${encodeURIComponent(clip.source)}&path=${encodeURIComponent(clip.path)}`

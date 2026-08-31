@@ -11,10 +11,12 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path"
 	"path/filepath"
 	"strings"
@@ -43,6 +45,12 @@ type Server struct {
 	// ConfigPath is where the quota policy and the runtime-added sources
 	// live (JSON).
 	ConfigPath string
+	// FFmpeg is the path to an ffmpeg binary, or empty when the machine has
+	// none. It is what turns a .dav from a download into something the
+	// browser plays: /api/clip/play repackages the recording through it on
+	// the fly. Found once at startup — a tool appearing mid-flight is a
+	// restart, not a poll.
+	FFmpeg string
 
 	// mu serialises config writes and enforcement runs. Listings do not take
 	// it — they read the directories, which is safe beside a delete.
@@ -55,6 +63,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/clips", s.handleClips)
 	mux.HandleFunc("GET /api/clip", s.handleClip)
+	mux.HandleFunc("GET /api/clip/play", s.handleClipPlay)
 	mux.HandleFunc("GET /api/sources", s.handleSourcesGet)
 	mux.HandleFunc("POST /api/sources", s.handleSourceAdd)
 	mux.HandleFunc("DELETE /api/sources", s.handleSourceRemove)
@@ -137,6 +146,7 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"version": version.String(),
 		"sources": srcs,
+		"ffmpeg":  s.FFmpeg != "",
 	})
 }
 
@@ -147,6 +157,11 @@ func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	list, missing := clips.ScanAll(srcs)
+	if s.FFmpeg != "" {
+		for i := range list {
+			list[i].Remuxable = clips.RemuxCandidate(list[i].Ext)
+		}
+	}
 	writeJSON(w, map[string]any{"clips": list, "missing_sources": missing})
 }
 
@@ -286,6 +301,78 @@ func (s *Server) handleClip(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/octet-stream")
 	}
 	http.ServeFile(w, r, full)
+}
+
+// handleClipPlay streams a recording the browser cannot take as-is —
+// .dav above all — repackaged on the fly into fragmented MP4. The codec is
+// copied, never re-encoded: a Dahua camera's H.264 is already something a
+// browser decodes, it is only the container the browser refuses, and a stream
+// copy is cheap enough for a Raspberry Pi where a transcode is not.
+//
+// The output has no known length, so there is no Content-Length and no range
+// support — the player streams from the start rather than scrubbing freely.
+// The trade is deliberate: seekable output would mean remuxing the whole file
+// to disk first, and a clip a few seconds long does not earn that.
+//
+// ffmpeg's first bytes are awaited before the response status is committed,
+// because failure here is ordinary — an .avi carrying MJPEG, a truncated
+// file — and it must arrive as an error the client can read, not a 200 that
+// dies mid-body.
+func (s *Server) handleClipPlay(w http.ResponseWriter, r *http.Request) {
+	if s.FFmpeg == "" {
+		httpError(w, http.StatusNotImplemented, "playing this format needs ffmpeg on the server, and none was found — install it and restart, or download the clip instead")
+		return
+	}
+	full, ok := s.resolve(r.URL.Query().Get("source"), r.URL.Query().Get("path"))
+	if !ok {
+		httpError(w, http.StatusBadRequest, "bad source or path")
+		return
+	}
+
+	// CommandContext ties ffmpeg's life to the request: a closed tab kills
+	// the process rather than leaving it piping into nothing.
+	cmd := exec.CommandContext(r.Context(), s.FFmpeg,
+		"-v", "error",
+		"-i", full,
+		"-c", "copy",
+		// Fragmented MP4 is what makes an unseekable pipe playable at all:
+		// a plain MP4 puts its index at the end, which a stream never
+		// reaches until it is over.
+		"-movflags", "frag_keyframe+empty_moov+default_base_moof",
+		"-f", "mp4", "pipe:1",
+	)
+	var stderr strings.Builder
+	cmd.Stderr = &stderr
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "starting ffmpeg: %v", err)
+		return
+	}
+	if err := cmd.Start(); err != nil {
+		httpError(w, http.StatusInternalServerError, "starting ffmpeg: %v", err)
+		return
+	}
+	defer cmd.Wait()
+
+	// The probe read: EOF before a single byte means ffmpeg gave up on the
+	// input, and whatever it said on stderr is the only useful answer.
+	first := make([]byte, 64*1024)
+	n, readErr := io.ReadAtLeast(stdout, first, 1)
+	if n == 0 {
+		cmd.Wait()
+		msg := strings.TrimSpace(stderr.String())
+		if msg == "" && readErr != nil {
+			msg = readErr.Error()
+		}
+		httpError(w, http.StatusUnprocessableEntity, "ffmpeg could not repackage this clip: %s", msg)
+		return
+	}
+
+	w.Header().Set("Content-Type", "video/mp4")
+	if _, err := w.Write(first[:n]); err != nil {
+		return // the client went away; the deferred Wait reaps ffmpeg
+	}
+	io.Copy(w, stdout)
 }
 
 // resolve turns an API-supplied (source, relative path) pair into an absolute

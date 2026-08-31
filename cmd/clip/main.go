@@ -14,6 +14,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -161,9 +162,20 @@ func cmdServe(args []string) {
 
 	pinned, data := resolveSources(clipsFlags, *dataFlag)
 
+	// The machine's own ffmpeg is what turns a .dav from a download into
+	// something the browser plays — the same arrangement as shelling out to
+	// git: a clip ffmpeg can read here is one the app can play. Its absence
+	// is a state to announce at startup, not to discover click by click.
+	ffmpeg, err := exec.LookPath("ffmpeg")
+	if err != nil {
+		ffmpeg = ""
+		log.Printf("ffmpeg not found — .dav and other camera formats will download instead of playing; install ffmpeg and restart to change that")
+	}
+
 	srv := &server.Server{
 		PinnedSources: pinned,
 		ConfigPath:    filepath.Join(data, "config.json"),
+		FFmpeg:        ffmpeg,
 	}
 	if *every > 0 {
 		go srv.EnforceLoop(*every)

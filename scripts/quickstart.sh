@@ -91,6 +91,12 @@
 #
 #   INSTALL_NODE     auto | never            install Node 22 if missing/old (default: auto; build-time only)
 #   INSTALL_GO       auto | never            install Go if missing/old (default: auto; build-time only)
+#   INSTALL_FFMPEG   auto | never            install ffmpeg if missing (default: auto).
+#                    Unlike Node and Go this is NOT build-time only — ffmpeg is
+#                    what the service runs to repackage .dav (and the other
+#                    camera containers) into something a browser plays, so it
+#                    stays installed. Without it those formats are offered as
+#                    downloads, and everything else works.
 #   BACKUP_KEEP      pre-upgrade backups kept (default: 10)
 #
 # A NOTE ON HOST.  This defaults to 0.0.0.0, so the service is reachable from
@@ -182,6 +188,7 @@ CLIPS_DIRS="${CLIPS_DIRS:-$DATA_DIR/clips}"
 
 INSTALL_NODE="${INSTALL_NODE:-auto}"
 INSTALL_GO="${INSTALL_GO:-auto}"
+INSTALL_FFMPEG="${INSTALL_FFMPEG:-auto}"
 BACKUP_KEEP="${BACKUP_KEEP:-10}"
 
 SRC_DIR="$PREFIX/src"
@@ -308,6 +315,27 @@ ensure_pkg curl
 ensure_pkg ca-certificates
 [ "$INSTALL_MODE" = source ] && ensure_pkg git
 ok "curl, ca-certificates$( [ "$INSTALL_MODE" = source ] && echo ", git" ) present"
+
+# ffmpeg is a runtime dependency, not a build one: the service runs it to
+# repackage .dav and the other camera containers into something a browser
+# plays. Nothing here is fatal — a host that cannot install it gets an app
+# that offers those formats as downloads and works in every other respect,
+# and the server says so in its own log at startup.
+if command -v ffmpeg >/dev/null 2>&1; then
+  ok "ffmpeg present ($(ffmpeg -version 2>/dev/null | sed -n '1s/ffmpeg version \([^ ]*\).*/\1/p'))"
+elif [ "$INSTALL_FFMPEG" = never ]; then
+  warn "skipping ffmpeg (INSTALL_FFMPEG=never) — .dav will download instead of playing in the browser."
+elif [ "$APT" -eq 1 ]; then
+  log "installing ffmpeg (plays .dav in the browser)…"
+  if apt-get install -y ffmpeg >/dev/null 2>&1; then
+    ok "ffmpeg installed"
+  else
+    warn "could not install ffmpeg — .dav will download instead of playing in the browser."
+    warn "Install it later (apt-get install ffmpeg) and restart the service to change that."
+  fi
+else
+  warn "no ffmpeg and no apt-get to install it — .dav will download instead of playing in the browser."
+fi
 
 # Node and Go are build-time only — release mode needs neither.
 if [ "$INSTALL_MODE" = source ]; then

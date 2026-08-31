@@ -201,20 +201,37 @@ disables it), on demand from the app, and as a one-shot from the shell —
 
 ---
 
-## Formats, and the truth about `.dav`
+## Formats, and how `.dav` plays
 
 Everything a camera plausibly writes is listed and served: `.dav`, `.mp4`,
 `.m4v`, `.mov`, `.mkv`, `.avi`, `.webm`, `.ts`, `.flv`, `.h264`, `.h265`.
 
-What a **browser** will actually decode is a shorter list — `.mp4`, `.webm`,
+What a **browser** will take directly is a shorter list — `.mp4`, `.webm`,
 `.mov`, `.m4v` — and those play in place, with scrubbing (the server honours
-range requests). The rest, `.dav` above all, are offered as **downloads**,
-labelled by format, rather than a play button that spins forever: `.dav` is
-Dahua's proprietary container and no browser decodes it. Play the downloaded
-file in VLC, or remux it once with ffmpeg
-(`ffmpeg -i clip.dav -c copy clip.mp4`). Teaching the server to do that
-remuxing itself is the obvious next feature; until it exists the app doesn't
-pretend otherwise.
+range requests).
+
+The rest, **`.dav` above all**, play through the machine's own ffmpeg: the
+server repackages the recording on the fly into fragmented MP4 and streams
+it. The codec is **copied, never re-encoded** — a Dahua camera's H.264 is
+already something a browser decodes, it is only the container the browser
+refuses, and a stream copy is cheap enough for a Raspberry Pi where a
+transcode is not. The trade: a remuxed stream has no known length, so it
+plays from the start rather than scrubbing freely — for a clip a few seconds
+long, that is the whole clip. The row keeps its format badge so the
+difference stays explicable.
+
+Repackaging changes the container and never the codec, so a stream the
+browser genuinely cannot decode — MJPEG in an old `.avi`, H.265 where the
+browser lacks it — still fails, in the player, as a sentence with the
+download beside it rather than a black rectangle. VLC plays anything the
+camera wrote.
+
+This is the same arrangement as SAND Vault shelling out to git: the app
+carries no codecs of its own, it drives the ffmpeg on the machine — **a clip
+ffmpeg can read here is one the app can play**. `scripts/quickstart.sh`
+installs ffmpeg by default (`INSTALL_FFMPEG=never` skips it); without one,
+those formats are offered as labelled downloads, the server says so at
+startup, and everything else works.
 
 ---
 
@@ -225,9 +242,10 @@ usable from a script:
 
 | Endpoint | What |
 |---|---|
-| `GET /api/health` | `{status, version, sources}` — what the installer polls |
-| `GET /api/clips` | every clip across every source: source, path, camera, size, mtime, playable — plus which sources were unreadable |
+| `GET /api/health` | `{status, version, sources, ffmpeg}` — what the installer polls |
+| `GET /api/clips` | every clip across every source: source, path, camera, size, mtime, playable, remuxable — plus which sources were unreadable |
 | `GET /api/clip?source=…&path=…` | one clip's bytes, with range support; the source must be a configured one |
+| `GET /api/clip/play?source=…&path=…` | the clip repackaged through ffmpeg into streaming MP4 (`.dav` and friends); 422 with ffmpeg's own words when the file defeats it |
 | `GET /api/sources` | the source set: path, pinned, available |
 | `POST /api/sources` | add a source `{path}` — must exist and be absolute |
 | `DELETE /api/sources?path=…` | forget a runtime-added source (files untouched; pinned ones refuse) |

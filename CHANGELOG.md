@@ -10,6 +10,18 @@ tag that shouldn't be published.
 
 ## Unreleased — the 2026.8 line
 
+### .dav plays in the browser
+
+Formats a browser will not take directly — `.dav` above all — now play in
+place: the server repackages the recording on the fly through the machine's
+own ffmpeg into fragmented MP4, codec copied, never re-encoded, which is
+cheap enough for a Raspberry Pi. The quickstart installs ffmpeg by default
+(`INSTALL_FFMPEG=never` skips it); without one those formats stay labelled
+downloads and the server says so at startup. A stream the browser genuinely
+cannot decode (MJPEG in an old `.avi`) fails in the player as a sentence with
+the download beside it, and the player header now carries a download for
+every clip.
+
 ### One or more source directories
 
 Clips can now come from **several source directories** at once — the NVR's

@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react'
-import { api, clipURL } from './api'
+import { api, clipURL, playURL } from './api'
 import { COLORS, FONT, formatBytes } from './theme'
 import { Brand, DevMark } from './components/Brand'
 
@@ -533,14 +533,29 @@ function ClipRow({ clip, onPlay, showSource }) {
           {formatBytes(clip.size)} · {when.toLocaleString()}
         </div>
       </span>
-      {clip.playable ? (
-        <button type="button" onClick={() => onPlay(clip)} style={buttonStyle(true)}>
-          ▶ Play
-        </button>
+      {clip.playable || clip.remuxable ? (
+        <>
+          {clip.remuxable && (
+            /* The badge stays on a remuxed format: the play works because
+               the server repackages it, and naming the container keeps
+               "why does this one buffer differently" answerable. */
+            <span style={{
+              fontFamily: FONT.mono,
+              fontSize: '11px',
+              color: COLORS.textMuted,
+              border: `1px solid ${COLORS.border}`,
+              borderRadius: '4px',
+              padding: '2px 6px',
+            }}>{clip.ext.replace('.', '')}</span>
+          )}
+          <button type="button" onClick={() => onPlay(clip)} style={buttonStyle(true)}>
+            ▶ Play
+          </button>
+        </>
       ) : (
-        /* .dav and friends: a browser will not decode them, so the honest
-           offer is the bytes themselves. The badge names the format so the
-           difference doesn't read as a bug. */
+        /* No ffmpeg on the server (or a format nothing repackages): the
+           honest offer is the bytes themselves. The badge names the format
+           so the difference doesn't read as a bug. */
         <>
           <span style={{
             fontFamily: FONT.mono,
@@ -562,10 +577,17 @@ function ClipRow({ clip, onPlay, showSource }) {
   )
 }
 
-/* The player, over everything. Native controls: seeking, volume and fullscreen
-   are the browser's job, and range requests make scrubbing work — see the
-   /api/clip handler. */
+/* The player, over everything. Native controls: seeking, volume and
+   fullscreen are the browser's job. A natively playable clip is served as-is
+   with range support, so scrubbing works; a remuxed one (.dav) is a live
+   stream out of ffmpeg with no known length, so it plays from the start —
+   which for a clip a few seconds long is the whole clip.
+
+   Failure here is ordinary — a codec this browser lacks, a truncated file —
+   and it must land as a sentence with a way out, not a black rectangle. */
 function Player({ clip, onClose }) {
+  const [failed, setFailed] = useState(false)
+
   useEffect(() => {
     const onKey = (e) => { if (e.key === 'Escape') onClose() }
     window.addEventListener('keydown', onKey)
@@ -586,17 +608,47 @@ function Player({ clip, onClose }) {
       }}
     >
       <div onClick={(e) => e.stopPropagation()} style={{ width: 'min(92vw, 900px)' }}>
-        <div style={{ display: 'flex', alignItems: 'center', marginBottom: '8px' }}>
-          <span style={{ color: COLORS.text, fontSize: '14px' }}>{clip.name}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '8px' }}>
+          <span style={{
+            color: COLORS.text,
+            fontSize: '14px',
+            minWidth: 0,
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+          }}>{clip.name}</span>
           <span style={{ flex: 1 }} />
+          <a href={clipURL(clip)} download={clip.name} style={{
+            ...buttonStyle(),
+            textDecoration: 'none',
+            display: 'inline-flex',
+            alignItems: 'center',
+          }}>↓ Download</a>
           <button type="button" onClick={onClose} style={buttonStyle()}>Close</button>
         </div>
-        <video
-          src={clipURL(clip)}
-          controls
-          autoPlay
-          style={{ width: '100%', borderRadius: '8px', background: '#000' }}
-        />
+        {failed ? (
+          <div style={{
+            padding: '28px 20px',
+            borderRadius: '8px',
+            border: `1px solid ${COLORS.border}`,
+            background: COLORS.surface,
+            color: COLORS.textDim,
+            fontSize: '14px',
+            textAlign: 'center',
+          }}>
+            This clip's video stream is one this browser cannot decode —
+            repackaging changes the container, never the codec. Download it
+            and play it in VLC.
+          </div>
+        ) : (
+          <video
+            src={clip.playable ? clipURL(clip) : playURL(clip)}
+            controls
+            autoPlay
+            onError={() => setFailed(true)}
+            style={{ width: '100%', borderRadius: '8px', background: '#000' }}
+          />
+        )}
       </div>
     </div>
   )
