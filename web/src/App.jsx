@@ -9,18 +9,17 @@ import { Brand, DevMark } from './components/Brand'
    running a cleanup off the second. */
 export function App() {
   const [tab, setTab] = useState('clips')
-  const [clips, setClips] = useState(null)
-  const [labels, setLabels] = useState({})
   const [storage, setStorage] = useState(null)
   const [sources, setSources] = useState(null)
   const [error, setError] = useState(null)
   const [playing, setPlaying] = useState(null)
 
+  // Settings' data only. The clip browser fetches for itself, one day at a
+  // time — the whole point of the summary API is that opening the app does
+  // not mean downloading the archive.
   const refresh = useCallback(async () => {
     try {
-      const [c, s, src] = await Promise.all([api.clips(), api.storage(), api.sources()])
-      setClips(c.clips || [])
-      setLabels(c.channel_labels || {})
+      const [s, src] = await Promise.all([api.storage(), api.sources()])
       setStorage(s)
       setSources(src.sources || [])
       setError(null)
@@ -61,12 +60,9 @@ export function App() {
           }}>{error}</div>
         )}
 
-        {tab === 'clips' && clips && (
-          <ClipList
-            clips={clips}
-            labels={labels}
+        {tab === 'clips' && (
+          <ClipBrowser
             onPlay={setPlaying}
-            onChanged={refresh}
             // Naming the source on every row only earns its ink once there
             // is more than one place a clip could have come from.
             showSource={(sources || []).length > 1}
@@ -78,10 +74,8 @@ export function App() {
               <SourcesPanel sources={sources} usage={storage.usage} onChanged={refresh} />
             )}
             {storage && <StoragePanel storage={storage} onChanged={refresh} />}
+            {!storage && !error && <p style={{ color: COLORS.textMuted }}>Loading…</p>}
           </>
-        )}
-        {!clips && !error && (
-          <p style={{ color: COLORS.textMuted }}>Loading…</p>
         )}
       </main>
 
@@ -497,38 +491,133 @@ function dayLabel(date) {
   })
 }
 
-/* The clip browser: channels across the top, days down the page. A channel is
-   what the recordings themselves say they belong to (parsed from Dahua-style
-   names, with the camera directory as fallback), and the user can label one
-   with a name that means something — "Front door" instead of "N843A8 ch3". */
-function ClipList({ clips, labels, onPlay, onChanged, showSource }) {
-  const [channel, setChannel] = useState(null)
+/* The API's day key ("2026-08-30") as a local Date — new Date(string) would
+   read it as UTC midnight and shift the day in any western zone. */
+const parseDay = (day) => {
+  const [y, m, d] = day.split('-').map(Number)
+  return new Date(y, m - 1, d)
+}
+
+/* The day strip wants two lines of ink per day, no more. */
+function shortDayLabel(date) {
+  const now = new Date()
+  if (sameDay(date, now)) return 'Today'
+  const yesterday = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1)
+  if (sameDay(date, yesterday)) return 'Yest.'
+  const opts = { month: 'short', day: 'numeric' }
+  if (date.getFullYear() !== now.getFullYear()) opts.year = '2-digit'
+  return date.toLocaleDateString(undefined, opts)
+}
+
+const hourLabel = (hour) =>
+  new Date(2000, 0, 1, hour).toLocaleTimeString(undefined, { hour: 'numeric' })
+
+/* The clip browser, built for volume: cameras write hundreds of clips a day,
+   so nothing here is ever one long list. Navigation drills down — channel,
+   then day, then hour — and only the chosen day's clips are ever fetched:
+   the summary API carries the counts the menus are drawn from, and the
+   archive stays on the server until a specific day is asked for.
+
+   A channel is what the recordings themselves say they belong to (parsed
+   from Dahua-style names, with the camera directory as fallback), and the
+   user can label one with a name that means something — "Front door" instead
+   of "N843A8 ch3". */
+function ClipBrowser({ onPlay, showSource }) {
+  const [summary, setSummary] = useState(null)
+  const [channel, setChannel] = useState(null) // null = all channels
+  const [day, setDay] = useState(null) // 'YYYY-MM-DD', from the strip
+  const [clips, setClips] = useState(null) // the selected day's clips only
+  const [openHours, setOpenHours] = useState(null) // null until the user toggles
+  const [error, setError] = useState(null)
+
+  const labels = (summary && summary.channel_labels) || {}
+
+  const loadSummary = useCallback(async (ch) => {
+    try {
+      const s = await api.summary(ch)
+      setSummary(s)
+      setError(null)
+      return s
+    } catch (e) {
+      setError(e.message)
+      return null
+    }
+  }, [])
+
+  // A channel choice re-scopes the day counts; the selected day survives the
+  // switch when the new channel recorded that day too, else the newest day
+  // that exists is the only honest default.
+  useEffect(() => {
+    let stale = false
+    loadSummary(channel).then((s) => {
+      if (stale || !s) return
+      const days = s.days || []
+      setDay((d) => (days.some((row) => row.day === d) ? d : (days[0] ? days[0].day : null)))
+    })
+    return () => { stale = true }
+  }, [channel, loadSummary])
+
+  // The day's clips, fetched when the selection settles. Stale responses are
+  // dropped — on a slow link the previous day's answer must not land on top
+  // of the day picked after it.
+  useEffect(() => {
+    setClips(null)
+    setOpenHours(null)
+    if (day == null) return
+    let stale = false
+    api.clips({ day, channel }).then(
+      (c) => { if (!stale) { setClips(c.clips || []); setError(null) } },
+      (e) => { if (!stale) setError(e.message) },
+    )
+    return () => { stale = true }
+  }, [day, channel])
 
   const channels = useMemo(
-    () => [...new Set(clips.map((c) => c.channel))].sort(),
-    [clips],
+    () => (summary ? Object.keys(summary.channels || {}).sort() : []),
+    [summary],
   )
 
-  // Days newest first, clips newest first within each — by when the
-  // recording started, not when its upload finished. The API's oldest-first
-  // order belongs to enforcement, not to people.
-  const days = useMemo(() => {
-    const filtered = channel == null ? clips : clips.filter((c) => c.channel === channel)
-    const sorted = [...filtered].sort((a, b) => startOf(b) - startOf(a))
+  // The day's clips in hour buckets, newest hour first, newest clip first
+  // within each — by when the recording started, not when its upload
+  // finished.
+  const hours = useMemo(() => {
+    if (!clips) return null
+    const sorted = [...clips].sort((a, b) => startOf(b) - startOf(a))
     const out = []
     for (const clip of sorted) {
-      const date = startOf(clip)
+      const hour = startOf(clip).getHours()
       const last = out[out.length - 1]
-      if (last && sameDay(last.date, date)) {
+      if (last && last.hour === hour) {
         last.clips.push(clip)
+        last.bytes += clip.size
       } else {
-        out.push({ date, clips: [clip] })
+        out.push({ hour, clips: [clip], bytes: clip.size })
       }
     }
     return out
-  }, [clips, channel])
+  }, [clips])
 
-  if (clips.length === 0) {
+  // Which hour sections stand open: the user's own toggles once they have
+  // made any; before that, all of them on a light day, only the latest hour
+  // on a heavy one — the likeliest thing to check, without the wall of rows
+  // that sank the flat list.
+  const open = openHours
+    ?? new Set(
+      hours == null ? []
+        : clips.length <= 25 ? hours.map((h) => h.hour)
+          : hours.slice(0, 1).map((h) => h.hour),
+    )
+  const toggleHour = (hour) => {
+    const next = new Set(open)
+    if (next.has(hour)) next.delete(hour)
+    else next.add(hour)
+    setOpenHours(next)
+  }
+
+  if (!summary) {
+    return <p style={{ color: COLORS.textMuted }}>{error || 'Loading…'}</p>
+  }
+  if (channels.length === 0) {
     return (
       <p style={{ color: COLORS.textMuted, fontSize: '14px' }}>
         No clips yet. Point your cameras (or their NVR) at the clips directory —
@@ -537,59 +626,180 @@ function ClipList({ clips, labels, onPlay, onChanged, showSource }) {
     )
   }
 
+  const dayRows = summary.days || []
+  const selectedDay = dayRows.find((row) => row.day === day)
+
   return (
     <section>
+      {error && (
+        <p style={{ color: COLORS.error, fontSize: '13px', margin: '0 0 10px' }}>{error}</p>
+      )}
+
       {(channels.length > 1 || channels[0] !== '') && (
         <div style={{
           display: 'flex',
           gap: '6px',
           flexWrap: 'wrap',
           alignItems: 'center',
-          marginBottom: '12px',
+          marginBottom: '10px',
         }}>
           <Chip active={channel == null} onClick={() => setChannel(null)}>All</Chip>
           {channels.map((key) => (
             <Chip key={key} active={channel === key} onClick={() => setChannel(key)}>
               {channelName(key, labels)}
+              <span style={{ color: COLORS.textMuted, marginLeft: '5px', fontSize: '12px' }}>
+                {summary.channels[key].clips}
+              </span>
             </Chip>
           ))}
           {channel != null && channel !== '' && (
-            <ChannelRename channel={channel} label={labels[channel] || ''} onChanged={onChanged} />
+            <ChannelRename
+              channel={channel}
+              label={labels[channel] || ''}
+              onChanged={() => loadSummary(channel)}
+            />
           )}
         </div>
       )}
 
-      {days.map(({ date, clips: dayClips }) => (
-        <div key={date.toDateString()} style={{ marginBottom: '18px' }}>
-          <h3 style={{
-            margin: '0 0 8px',
-            fontSize: '13px',
-            fontWeight: 600,
-            color: COLORS.textDim,
-            textTransform: 'uppercase',
-            letterSpacing: '0.04em',
-          }}>
-            {dayLabel(date)}
-            <span style={{ color: COLORS.textMuted, fontWeight: 400, textTransform: 'none', letterSpacing: 0 }}>
-              {' '}· {dayClips.length} clip{dayClips.length === 1 ? '' : 's'}
-            </span>
-          </h3>
-          <div style={{ borderRadius: '10px', border: `1px solid ${COLORS.border}`, overflow: 'hidden' }}>
-            {dayClips.map((clip) => (
-              <ClipRow
-                key={`${clip.source}:${clip.path}`}
-                clip={clip}
-                onPlay={onPlay}
-                showSource={showSource}
-                // Inside a filtered channel every row would repeat the chip
-                // above it; only the "All" view needs the name per row.
-                channelName={channel == null ? channelName(clip.channel, labels) : null}
-              />
-            ))}
-          </div>
-        </div>
+      <DayStrip days={dayRows} day={day} onPick={setDay} />
+
+      {selectedDay && (
+        <h3 style={{
+          margin: '2px 0 10px',
+          fontSize: '13px',
+          fontWeight: 600,
+          color: COLORS.textDim,
+        }}>
+          {dayLabel(parseDay(selectedDay.day))}
+          <span style={{ color: COLORS.textMuted, fontWeight: 400 }}>
+            {' '}· {selectedDay.clips} clip{selectedDay.clips === 1 ? '' : 's'}
+            {' '}· {formatBytes(selectedDay.bytes)}
+          </span>
+        </h3>
+      )}
+
+      {day != null && clips == null && !error && (
+        <p style={{ color: COLORS.textMuted, fontSize: '14px' }}>Loading…</p>
+      )}
+
+      {hours && hours.map(({ hour, clips: hourClips, bytes }) => (
+        <HourSection
+          key={hour}
+          hour={hour}
+          clips={hourClips}
+          bytes={bytes}
+          open={open.has(hour)}
+          onToggle={() => toggleHour(hour)}
+          onPlay={onPlay}
+          showSource={showSource}
+          // Inside a filtered channel every row would repeat the chip above
+          // it; only the "All" view needs the name per row.
+          rowChannelName={channel == null ? (clip) => channelName(clip.channel, labels) : null}
+        />
       ))}
     </section>
+  )
+}
+
+/* One day per stop, horizontally scrollable — ninety days of archive is a
+   thumb-flick, not ninety headings. Each stop carries its clip count so a
+   busy day is visible before it is opened. */
+function DayStrip({ days, day, onPick }) {
+  if (days.length === 0) return null
+  return (
+    <div style={{
+      display: 'flex',
+      gap: '6px',
+      overflowX: 'auto',
+      WebkitOverflowScrolling: 'touch',
+      padding: '2px 0 8px',
+      marginBottom: '8px',
+    }}>
+      {days.map((row) => {
+        const active = row.day === day
+        return (
+          <button
+            key={row.day}
+            type="button"
+            onClick={() => onPick(row.day)}
+            style={{
+              flex: '0 0 auto',
+              display: 'flex',
+              flexDirection: 'column',
+              alignItems: 'center',
+              gap: '1px',
+              padding: '6px 12px',
+              borderRadius: '8px',
+              border: `1px solid ${active ? COLORS.accent : COLORS.border}`,
+              background: active ? `${COLORS.accent}22` : COLORS.surface,
+              color: active ? COLORS.accentBright : COLORS.textDim,
+              fontSize: '13px',
+              cursor: 'pointer',
+            }}
+          >
+            <span style={{ whiteSpace: 'nowrap' }}>{shortDayLabel(parseDay(row.day))}</span>
+            <span style={{
+              fontSize: '11px',
+              fontFamily: FONT.mono,
+              color: active ? COLORS.accentBright : COLORS.textMuted,
+            }}>{row.clips}</span>
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+/* One hour of one day: a header that reads as a sentence — "9 PM · 14 clips
+   · 68 MB" — and the rows only when asked for. The header is the unit of
+   skimming; a day of hundreds of clips reads as a dozen of these. */
+function HourSection({ hour, clips, bytes, open, onToggle, onPlay, showSource, rowChannelName }) {
+  return (
+    <div style={{
+      borderRadius: '10px',
+      border: `1px solid ${COLORS.border}`,
+      overflow: 'hidden',
+      marginBottom: '8px',
+      background: COLORS.surface,
+    }}>
+      <button
+        type="button"
+        onClick={onToggle}
+        style={{
+          display: 'flex',
+          alignItems: 'center',
+          gap: '8px',
+          width: '100%',
+          padding: '10px 12px',
+          border: 'none',
+          background: 'none',
+          color: COLORS.text,
+          fontSize: '13px',
+          textAlign: 'left',
+          cursor: 'pointer',
+        }}
+      >
+        <span style={{ color: COLORS.textMuted, width: '12px' }}>{open ? '▾' : '▸'}</span>
+        <span style={{ fontFamily: FONT.mono }}>{hourLabel(hour)}</span>
+        <span style={{ color: COLORS.textMuted }}>
+          {clips.length} clip{clips.length === 1 ? '' : 's'} · {formatBytes(bytes)}
+        </span>
+      </button>
+      {open && (
+        <div style={{ borderTop: `1px solid ${COLORS.border}` }}>
+          {clips.map((clip) => (
+            <ClipRow
+              key={`${clip.source}:${clip.path}`}
+              clip={clip}
+              onPlay={onPlay}
+              showSource={showSource}
+              channelName={rowChannelName ? rowChannelName(clip) : null}
+            />
+          ))}
+        </div>
+      )}
+    </div>
   )
 }
 

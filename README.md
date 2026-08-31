@@ -13,22 +13,26 @@ to a phone's home screen like an app.
 
 ```
 ┌ Clip Manager ──────────────────────────────── [Clips] [Settings] ─────┐
-│ [All] [Front door] [Driveway] [Backyard]              ✏️ Rename       │
+│ [All] [Front door 709] [Driveway 421] [Backyard 388]      ✏️ Rename   │
+│ [Today] [Yest.] [Aug 29] [Aug 28] [Aug 27] …  ←scrolls                │
+│ [ 285 ] [ 292 ] [ 281 ]  [ 279 ]  [ 282 ]                             │
 │                                                                       │
-│ TODAY · 3 clips                                                       │
-│  12:31:42 PM · Front door    3.1 MB · …_ch3_main_202…      ▶ Play    │
-│  12:31:29 PM · Driveway      2.4 MB · …_ch1_main_202…      ▶ Play    │
-│  12:31:14 PM · Front door    2.9 MB · …_ch3_main_202…      ▶ Play    │
-│                                                                       │
-│ YESTERDAY · 214 clips                                                 │
-│  11:58:03 PM · Backyard      2.2 MB · …_ch4_main_202…      ▶ Play    │
+│ Today · 285 clips · 1.4 GB                                            │
+│ ▾ 10 PM   16 clips · 83 MB                                            │
+│    10:59:46 PM · Front door   6.4 MB · …_ch3_main_202…     ▶ Play    │
+│    10:56:06 PM · Driveway     3.6 MB · …_ch1_main_202…     ▶ Play    │
+│ ▸ 9 PM    22 clips · 108 MB                                           │
+│ ▸ 8 PM    19 clips · 96 MB                                            │
 └───────────────────────────────────────────────────────────────────────┘
 ```
 
-The home page is the footage: clips grouped into **channels** (read from the
-recordings' own filenames, labelable to names that mean something) and into
-**days**, newest first, each row led by when the recording started. Sources
-and quotas live behind the **Settings** tab.
+The home page is the footage, organized for cameras that write **hundreds of
+clips a day**: drill down by **channel** (read from the recordings' own
+filenames, labelable to names that mean something), then by **day** on a
+scrollable strip with per-day counts, then by collapsible **hour**. Each row
+is led by when the recording started. Only the chosen day's clips are ever
+fetched — the menus are drawn from a lightweight summary API. Sources and
+quotas live behind the **Settings** tab.
 
 ---
 
@@ -251,7 +255,8 @@ usable from a script:
 | Endpoint | What |
 |---|---|
 | `GET /api/health` | `{status, version, sources, ffmpeg}` — what the installer polls |
-| `GET /api/clips` | every clip across every source: source, path, camera, channel, start time, size, mtime, playable, remuxable — plus which sources were unreadable and the channel labels |
+| `GET /api/clips` | clips across every source: source, path, camera, channel, start time, size, mtime, playable, remuxable — plus which sources were unreadable and the channel labels; `?day=YYYY-MM-DD` and `?channel=` filter, which is how the app fetches (one day at a time) |
+| `GET /api/summary` | the archive without its weight: clip/byte counts per channel and per day (`?channel=` scopes the days), newest day first — what the app draws its menus from |
 | `GET /api/clip?source=…&path=…` | one clip's bytes, with range support; the source must be a configured one |
 | `GET /api/clip/play?source=…&path=…` | the clip repackaged through ffmpeg into a cached, seekable MP4 (`.dav` and friends); `&transcode=1` forces H.264; 422 with ffmpeg's own words when the file defeats it |
 | `PUT /api/channels/label` | name a channel `{channel, label}` — an empty label forgets the name |

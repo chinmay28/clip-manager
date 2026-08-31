@@ -11,9 +11,23 @@ async function request(path, options) {
   return body
 }
 
+/* The archive is navigated summary-first: /api/summary says what exists
+   (channels, days, counts), and /api/clips is asked for one day at a time —
+   at hundreds of clips a day, the full listing is a download nobody meant to
+   start. channel may be '' (the clips nothing claims), so its presence, not
+   its truthiness, is what filters. */
+const clipQuery = ({ day, channel } = {}) => {
+  const q = new URLSearchParams()
+  if (day) q.set('day', day)
+  if (channel != null) q.set('channel', channel)
+  const qs = q.toString()
+  return qs ? `?${qs}` : ''
+}
+
 export const api = {
   health: () => request('/api/health'),
-  clips: () => request('/api/clips'),
+  clips: (opts) => request(`/api/clips${clipQuery(opts)}`),
+  summary: (channel) => request(`/api/summary${clipQuery({ channel })}`),
   sources: () => request('/api/sources'),
   addSource: (path) => request('/api/sources', {
     method: 'POST',

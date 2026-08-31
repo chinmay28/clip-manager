@@ -170,3 +170,69 @@ func TestChannelLabelRoundTrip(t *testing.T) {
 		t.Fatalf("label clear: want 200, got %d: %s", rec.Code, rec.Body.String())
 	}
 }
+
+func TestSummaryAndDayFilter(t *testing.T) {
+	source := t.TempDir()
+	for _, name := range []string{
+		"N843A8_ch3_main_20260830214636_20260830214641.dav",
+		"N843A8_ch3_main_20260830090000_20260830090005.dav",
+		"N843A8_ch4_main_20260830120000_20260830120005.dav",
+		"N843A8_ch3_main_20260829120000_20260829120005.dav",
+	} {
+		if err := os.WriteFile(filepath.Join(source, name), []byte("xxxx"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := testServer(t, source)
+
+	// The summary: channel totals over everything, day rows newest first.
+	rec := httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/summary", nil))
+	var sum struct {
+		Channels map[string]struct{ Clips int } `json:"channels"`
+		Days     []struct {
+			Day   string `json:"day"`
+			Clips int    `json:"clips"`
+		} `json:"days"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if sum.Channels["N843A8_ch3"].Clips != 3 || sum.Channels["N843A8_ch4"].Clips != 1 {
+		t.Fatalf("channel totals wrong: %+v", sum.Channels)
+	}
+	if len(sum.Days) != 2 || sum.Days[0].Day != "2026-08-30" || sum.Days[0].Clips != 3 || sum.Days[1].Clips != 1 {
+		t.Fatalf("day rows wrong: %+v", sum.Days)
+	}
+
+	// Scoped to one channel, the days reflect only its clips.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/summary?channel=N843A8_ch4", nil))
+	sum.Days = nil
+	if err := json.Unmarshal(rec.Body.Bytes(), &sum); err != nil {
+		t.Fatal(err)
+	}
+	if len(sum.Days) != 1 || sum.Days[0].Clips != 1 {
+		t.Fatalf("channel-scoped day rows wrong: %+v", sum.Days)
+	}
+
+	// The listing, one day of one channel at a time.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips?day=2026-08-30&channel=N843A8_ch3", nil))
+	var body struct {
+		Clips []map[string]any `json:"clips"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Clips) != 2 {
+		t.Fatalf("want 2 clips for ch3 on the 30th, got %d", len(body.Clips))
+	}
+
+	// A malformed day is refused, not silently empty.
+	rec = httptest.NewRecorder()
+	s.Handler().ServeHTTP(rec, httptest.NewRequest("GET", "/api/clips?day=yesterday", nil))
+	if rec.Code != 400 {
+		t.Fatalf("want 400 for a bad day, got %d", rec.Code)
+	}
+}

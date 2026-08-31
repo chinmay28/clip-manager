@@ -10,18 +10,26 @@ tag that shouldn't be published.
 
 ## Unreleased — the 2026.8 line
 
-### Channels, days, and a clean front page
+### Channels, days, hours — and a clean front page
 
 The home page is now the clips and nothing else — the *Sources* and *Storage*
-panels moved to a **Settings** tab. The flat file list is gone: clips are
-grouped into **channels**, read from the recordings' own names
+panels moved to a **Settings** tab. The flat file list is gone, replaced by a
+drill-down built for cameras that write hundreds of clips a day: **channel**,
+then **day**, then **hour**. Channels are read from the recordings' own names
 (`N843A8_ch3_main_…` → channel `N843A8_ch3`, with the camera directory as the
-fallback), and a channel can be **labeled** — select its chip, rename, and
-"N843A8 ch3" becomes "Front door" in every browser, stored in the server's
-config. Within a channel (or across all of them) clips are grouped by **day**
-— *Today*, *Yesterday*, then dates — newest first, each row led by the time
-the recording **started**, parsed from the filename's timestamp rather than
-the upload's mtime.
+fallback) and can be **labeled** — select a chip, rename, and "N843A8 ch3"
+becomes "Front door" in every browser, stored in the server's config. Days
+sit in a horizontally scrollable strip (*Today*, *Yest.*, dates), each stop
+carrying its clip count; the chosen day's clips group into collapsible
+**hour sections** ("9 PM · 14 clips · 68 MB") with only the latest hour open
+on a busy day. Each row is led by the time the recording **started**, parsed
+from the filename's timestamp rather than the upload's mtime.
+
+The browsing is as light as it looks: a new `GET /api/summary` carries just
+the counts the menus are drawn from, and `GET /api/clips` takes `?day=` and
+`?channel=` filters — the client fetches one day of one channel at a time,
+so opening the app on a phone no longer downloads the whole archive's
+listing.
 
 ### .dav plays in the browser
 

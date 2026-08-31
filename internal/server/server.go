@@ -71,6 +71,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /api/health", s.handleHealth)
 	mux.HandleFunc("GET /api/clips", s.handleClips)
+	mux.HandleFunc("GET /api/summary", s.handleSummary)
 	mux.HandleFunc("GET /api/clip", s.handleClip)
 	mux.HandleFunc("GET /api/clip/play", s.handleClipPlay)
 	mux.HandleFunc("GET /api/sources", s.handleSourcesGet)
@@ -160,6 +161,19 @@ func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// dayOf buckets a clip by the calendar day its recording started, in the
+// server's local zone — the same zone the timestamps were parsed in.
+func dayOf(c clips.Clip) string { return c.StartTime.Local().Format("2006-01-02") }
+
+// handleClips lists clips — all of them, or one day of one channel. The
+// filters exist because the volume demands them: cameras write hundreds of
+// clips a day, and a client that only wants Tuesday's front door footage
+// should not be handed the entire archive to throw most of it away.
+//
+//	?day=2026-08-30   only clips whose recording started that day (local time)
+//	?channel=X        only that channel ("" is a real channel: the clips
+//	                  nothing claims — presence of the parameter is what
+//	                  filters, so it must be Has, not a zero check)
 func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 	srcs, err := s.sources()
 	if err != nil {
@@ -167,6 +181,20 @@ func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	list, missing := clips.ScanAll(srcs)
+
+	q := r.URL.Query()
+	if day := q.Get("day"); day != "" {
+		if _, err := time.ParseInLocation("2006-01-02", day, time.Local); err != nil {
+			httpError(w, http.StatusBadRequest, "day must be YYYY-MM-DD (got %q)", day)
+			return
+		}
+		list = filterClips(list, func(c clips.Clip) bool { return dayOf(c) == day })
+	}
+	if q.Has("channel") {
+		channel := q.Get("channel")
+		list = filterClips(list, func(c clips.Clip) bool { return c.Channel == channel })
+	}
+
 	if s.FFmpeg != "" {
 		for i := range list {
 			list[i].Remuxable = clips.RemuxCandidate(list[i].Ext)
@@ -185,6 +213,92 @@ func (s *Server) handleClips(w http.ResponseWriter, r *http.Request) {
 		labels = map[string]string{}
 	}
 	writeJSON(w, map[string]any{"clips": list, "missing_sources": missing, "channel_labels": labels})
+}
+
+func filterClips(list []clips.Clip, keep func(clips.Clip) bool) []clips.Clip {
+	out := list[:0]
+	for _, c := range list {
+		if keep(c) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// handleSummary is the shape of the archive without its weight: how many
+// clips each channel holds, and — for one channel or all of them — how many
+// each day holds, newest day first. It is what the client navigates by; the
+// clips themselves come one day at a time from /api/clips. At hundreds of
+// clips a day the full listing runs to megabytes, and a phone opening the app
+// to check one camera should not download the archive to draw a menu.
+//
+//	?channel=X   day counts for that channel only (channel totals stay global
+//	             — the chips keep their numbers while one is selected)
+func (s *Server) handleSummary(w http.ResponseWriter, r *http.Request) {
+	srcs, err := s.sources()
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading sources: %v", err)
+		return
+	}
+	list, missing := clips.ScanAll(srcs)
+
+	type bucket struct {
+		Clips int   `json:"clips"`
+		Bytes int64 `json:"bytes"`
+	}
+	channels := map[string]*bucket{}
+	for _, c := range list {
+		b := channels[c.Channel]
+		if b == nil {
+			b = &bucket{}
+			channels[c.Channel] = b
+		}
+		b.Clips++
+		b.Bytes += c.Size
+	}
+
+	q := r.URL.Query()
+	if q.Has("channel") {
+		channel := q.Get("channel")
+		list = filterClips(list, func(c clips.Clip) bool { return c.Channel == channel })
+	}
+	type dayRow struct {
+		Day   string `json:"day"`
+		Clips int    `json:"clips"`
+		Bytes int64  `json:"bytes"`
+	}
+	byDay := map[string]*dayRow{}
+	for _, c := range list {
+		day := dayOf(c)
+		row := byDay[day]
+		if row == nil {
+			row = &dayRow{Day: day}
+			byDay[day] = row
+		}
+		row.Clips++
+		row.Bytes += c.Size
+	}
+	days := make([]dayRow, 0, len(byDay))
+	for _, row := range byDay {
+		days = append(days, *row)
+	}
+	sort.Slice(days, func(i, j int) bool { return days[i].Day > days[j].Day })
+
+	cfg, err := storage.Load(s.ConfigPath)
+	if err != nil {
+		httpError(w, http.StatusInternalServerError, "reading config: %v", err)
+		return
+	}
+	labels := cfg.ChannelLabels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	writeJSON(w, map[string]any{
+		"channels":        channels,
+		"days":            days,
+		"channel_labels":  labels,
+		"missing_sources": missing,
+	})
 }
 
 // handleChannelLabel names (or, with an empty label, un-names) one channel.
